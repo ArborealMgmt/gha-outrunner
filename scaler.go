@@ -31,8 +31,14 @@ type Scaler struct {
 	runner      *RunnerConfig
 	provisioner Provisioner
 
-	mu      sync.Mutex
-	runners map[string]*RunnerState
+	mu               sync.Mutex
+	runners          map[string]*RunnerState
+	completedRunners map[string]bool
+	completedJobs    int
+	draining         bool
+	drainFailed      bool
+	drained          chan struct{}
+	drainedOnce      sync.Once
 
 	lifecycleCtx    context.Context
 	lifecycleCancel context.CancelFunc
@@ -44,22 +50,28 @@ var _ listener.Scaler = (*Scaler)(nil)
 func NewScaler(logger *slog.Logger, client ScaleSetClient, scaleSetID, maxRunners int, namePrefix string, runner *RunnerConfig, prov Provisioner) *Scaler {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Scaler{
-		logger:          logger,
-		client:          client,
-		scaleSetID:      scaleSetID,
-		maxRunners:      maxRunners,
-		namePrefix:      namePrefix,
-		runner:          runner,
-		provisioner:     prov,
-		runners:         make(map[string]*RunnerState),
-		lifecycleCtx:    ctx,
-		lifecycleCancel: cancel,
+		logger:           logger,
+		client:           client,
+		scaleSetID:       scaleSetID,
+		maxRunners:       maxRunners,
+		namePrefix:       namePrefix,
+		runner:           runner,
+		provisioner:      prov,
+		runners:          make(map[string]*RunnerState),
+		completedRunners: make(map[string]bool),
+		drained:          make(chan struct{}),
+		lifecycleCtx:     ctx,
+		lifecycleCancel:  cancel,
 	}
 }
 
 func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.draining {
+		return len(s.runners), nil
+	}
 
 	target := min(s.maxRunners, count)
 	current := len(s.runners)
@@ -131,6 +143,17 @@ func (s *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 
 	s.mu.Lock()
 	state, exists := s.runners[jobInfo.RunnerName]
+	if exists && !s.completedRunners[jobInfo.RunnerName] {
+		s.completedRunners[jobInfo.RunnerName] = true
+		s.completedJobs++
+		if s.runner.MaxJobs > 0 && s.completedJobs >= s.runner.MaxJobs {
+			s.draining = true
+			s.logger.Info("Maximum job count reached; stopping admission",
+				slog.Int("completedJobs", s.completedJobs),
+				slog.Int("maxJobs", s.runner.MaxJobs),
+			)
+		}
+	}
 	s.mu.Unlock()
 
 	if exists {
@@ -138,6 +161,12 @@ func (s *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 	}
 
 	return nil
+}
+
+// Drained closes after max_jobs has stopped admission and every tracked runner
+// has been stopped and deregistered. It never closes when max_jobs is zero.
+func (s *Scaler) Drained() <-chan struct{} {
+	return s.drained
 }
 
 // Shutdown cancels all runner goroutines and waits for them to finish.
@@ -191,7 +220,8 @@ func (s *Scaler) Runners() []RunnerSnapshot {
 // deregistration, and map cleanup.
 func (s *Scaler) runRunnerLifecycle(state *RunnerState, req *RunnerRequest) {
 	defer s.wg.Done()
-	defer s.removeRunner(state.Name)
+	cleaned := false
+	defer func() { s.removeRunner(state.Name, cleaned) }()
 
 	name := state.Name
 
@@ -201,7 +231,7 @@ func (s *Scaler) runRunnerLifecycle(state *RunnerState, req *RunnerRequest) {
 			slog.String("name", name),
 			slog.String("error", err.Error()),
 		)
-		s.deregisterRunner(name, state.RunnerID)
+		cleaned = s.deregisterRunner(name, state.RunnerID)
 		return
 	}
 
@@ -237,21 +267,29 @@ func (s *Scaler) runRunnerLifecycle(state *RunnerState, req *RunnerRequest) {
 			slog.String("name", name),
 			slog.String("error", err.Error()),
 		)
+		return
 	}
 
 	// 4. Deregister from GitHub
-	s.deregisterRunner(name, state.RunnerID)
+	cleaned = s.deregisterRunner(name, state.RunnerID)
 }
 
-func (s *Scaler) removeRunner(name string) {
+func (s *Scaler) removeRunner(name string, cleaned bool) {
 	s.mu.Lock()
 	delete(s.runners, name)
+	delete(s.completedRunners, name)
+	if s.draining && !cleaned {
+		s.drainFailed = true
+	}
+	if s.draining && !s.drainFailed && len(s.runners) == 0 {
+		s.drainedOnce.Do(func() { close(s.drained) })
+	}
 	s.mu.Unlock()
 }
 
-func (s *Scaler) deregisterRunner(name string, runnerID int) {
+func (s *Scaler) deregisterRunner(name string, runnerID int) bool {
 	if runnerID == 0 {
-		return
+		return false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -261,5 +299,7 @@ func (s *Scaler) deregisterRunner(name string, runnerID int) {
 			slog.Int("runnerID", runnerID),
 			slog.String("error", err.Error()),
 		)
+		return false
 	}
+	return true
 }

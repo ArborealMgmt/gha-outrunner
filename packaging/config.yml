@@ -27,6 +27,8 @@ token_file: /etc/outrunner/token
 # runners:
 #   linux:
 #     labels: [self-hosted, linux]
+#     # Optional: stop admission and exit cleanly after this many completed jobs.
+#     max_jobs: 1
 #     docker:
 #       image: ghcr.io/actions/actions-runner:latest
 #   # Example: runner targeting a different repo

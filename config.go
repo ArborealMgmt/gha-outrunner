@@ -26,6 +26,7 @@ type RunnerConfig struct {
 	TokenFile  string        `yaml:"token_file,omitempty"`
 	Labels     []string      `yaml:"labels"`
 	MaxRunners int           `yaml:"max_runners,omitempty"`
+	MaxJobs    int           `yaml:"max_jobs,omitempty"`
 	Docker     *DockerImage  `yaml:"docker,omitempty"`
 	Libvirt    *LibvirtImage `yaml:"libvirt,omitempty"`
 	Tart       *TartImage    `yaml:"tart,omitempty"`
@@ -111,6 +112,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	for name, runner := range cfg.Runners {
+		if runner.MaxJobs < 0 {
+			return nil, fmt.Errorf("runner %q: max_jobs must not be negative", name)
+		}
 		if len(runner.Labels) == 0 {
 			return nil, fmt.Errorf("runner %q: labels are required", name)
 		}

@@ -203,6 +203,48 @@ runners:
 	}
 }
 
+func TestLoadConfigMaxJobs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := `url: https://github.com/org/repo
+runners:
+  single-use:
+    labels: [linux]
+    max_jobs: 1
+    docker:
+      image: runner:latest
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.Runners["single-use"].MaxJobs != 1 {
+		t.Fatalf("expected max_jobs 1, got %d", cfg.Runners["single-use"].MaxJobs)
+	}
+}
+
+func TestLoadConfigRejectsNegativeMaxJobs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := `url: https://github.com/org/repo
+runners:
+  invalid:
+    labels: [linux]
+    max_jobs: -1
+    docker:
+      image: runner:latest
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err == nil {
+		t.Fatal("expected negative max_jobs to fail")
+	}
+}
+
 func TestLoadConfigRunnerCmd(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
