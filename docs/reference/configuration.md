@@ -14,6 +14,7 @@ runners:
     token_file: <string>             # Optional per-runner token file override.
     labels: [<string>, ...]          # Labels registered on this scale set.
     max_runners: <int>               # Optional. Defaults to --max-runners flag.
+    max_jobs: <int>                  # Optional. Stop admission after N completed jobs.
     docker:                          # Use Docker backend.
       image: <string>                # Docker image name or tag.
       runner_cmd: <string>           # Default: ./run.sh
@@ -113,6 +114,13 @@ jobs:
 ### `runners.<name>.max_runners`
 
 **Optional.** Maximum number of concurrent runners for this scale set. If not specified, defaults to the `--max-runners` CLI flag value (default: 2).
+
+### `runners.<name>.max_jobs`
+
+**Optional.** Stop admitting runners after this many jobs complete, wait for runner cleanup and deregistration, then
+exit cleanly. The default `0` is unlimited. `max_jobs: 1` with `max_runners: 1` provides a single-use host contract:
+job completion closes admission atomically before the finished runner is removed, so a concurrent desired-count
+message cannot create replacement work on the draining host.
 
 ### `runners.<name>.docker`
 

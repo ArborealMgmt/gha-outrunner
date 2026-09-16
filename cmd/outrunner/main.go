@@ -225,9 +225,24 @@ func runWorker(ctx context.Context, logger, listenerLogger *slog.Logger, client 
 		logger.WithGroup("scaler"),
 		client, scaleSet.ID, maxRunners, name, runner, prov,
 	)
+	listenerCtx, listenerCancel := context.WithCancel(ctx)
+	defer listenerCancel()
+	go func() {
+		select {
+		case <-scaler.Drained():
+			logger.Info("Runner scale set drained after maximum job count",
+				slog.Int("maxJobs", runner.MaxJobs),
+			)
+			listenerCancel()
+		case <-listenerCtx.Done():
+		}
+	}()
 
-	logger.Info("Listening for jobs", slog.Int("maxRunners", maxRunners))
-	err = l.Run(ctx, scaler)
+	logger.Info("Listening for jobs",
+		slog.Int("maxRunners", maxRunners),
+		slog.Int("maxJobs", runner.MaxJobs),
+	)
+	err = l.Run(listenerCtx, scaler)
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()

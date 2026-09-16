@@ -6,6 +6,8 @@ url: https://github.com/your-org/your-repo
 runners:
   linux:
     labels: [self-hosted, linux]
+    # Optional: make the host single-use and exit after safe cleanup.
+    # max_jobs: 1
     docker:
       image: outrunner-runner:latest
       # Optional: bind mount a host directory into every container.

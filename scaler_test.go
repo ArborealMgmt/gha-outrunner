@@ -19,6 +19,7 @@ type mockClient struct {
 	nextID      int
 	removeCount atomic.Int32
 	jitErr      error // if set, GenerateJitRunnerConfig returns this error
+	removeErr   error
 }
 
 func newMockClient() *mockClient {
@@ -46,7 +47,7 @@ func (m *mockClient) GenerateJitRunnerConfig(_ context.Context, setting *scalese
 
 func (m *mockClient) RemoveRunner(_ context.Context, _ int64) error {
 	m.removeCount.Add(1)
-	return nil
+	return m.removeErr
 }
 
 // mockProvisioner implements Provisioner for testing.
@@ -212,6 +213,113 @@ func TestHappyPath(t *testing.T) {
 	// Verify RemoveRunner was called
 	if client.removeCount.Load() != 1 {
 		t.Errorf("expected 1 RemoveRunner call, got %d", client.removeCount.Load())
+	}
+
+	s.Shutdown(context.Background())
+}
+
+func TestMaxJobsStopsAdmissionBeforeRunnerRemoval(t *testing.T) {
+	client := newMockClient()
+	prov := newMockProvisioner()
+	runner := &RunnerConfig{
+		MaxJobs: 1,
+		Docker:  &DockerImage{Image: "test:latest"},
+	}
+	s := NewScaler(noopLogger(), client, 1, 1, "test", runner, prov)
+
+	if _, err := s.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	name := s.Runners()[0].Name
+
+	if err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{
+		RunnerName: name,
+		Result:     "succeeded",
+	}); err != nil {
+		t.Fatalf("HandleJobCompleted: %v", err)
+	}
+
+	// A desired-count message racing completion must not admit replacement work.
+	if count, err := s.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount while draining: %v", err)
+	} else if count > 1 {
+		t.Fatalf("expected at most the completing runner, got %d", count)
+	}
+
+	select {
+	case <-s.Drained():
+	case <-time.After(2 * time.Second):
+		t.Fatal("scaler did not report drained")
+	}
+
+	if count, err := s.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount after drain: %v", err)
+	} else if count != 0 {
+		t.Fatalf("expected zero runners after drain, got %d", count)
+	}
+	if client.nextID != 2 {
+		t.Fatalf("expected exactly one JIT runner, next ID is %d", client.nextID)
+	}
+
+	s.Shutdown(context.Background())
+}
+
+func TestDuplicateCompletionCountsOnce(t *testing.T) {
+	client := newMockClient()
+	prov := newMockProvisioner()
+	runner := &RunnerConfig{
+		MaxJobs: 2,
+		Docker:  &DockerImage{Image: "test:latest"},
+	}
+	s := NewScaler(noopLogger(), client, 1, 1, "test", runner, prov)
+	_, _ = s.HandleDesiredRunnerCount(context.Background(), 1)
+	time.Sleep(50 * time.Millisecond)
+	name := s.Runners()[0].Name
+	completion := &scaleset.JobCompleted{RunnerName: name, Result: "succeeded"}
+	_ = s.HandleJobCompleted(context.Background(), completion)
+	_ = s.HandleJobCompleted(context.Background(), completion)
+	time.Sleep(100 * time.Millisecond)
+
+	select {
+	case <-s.Drained():
+		t.Fatal("duplicate completion incorrectly exhausted max_jobs")
+	default:
+	}
+	if _, err := s.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("replacement admission after first job: %v", err)
+	}
+
+	s.Shutdown(context.Background())
+}
+
+func TestMaxJobsDoesNotReportDrainedWhenDeregistrationFails(t *testing.T) {
+	client := newMockClient()
+	client.removeErr = errors.New("GitHub unavailable")
+	prov := newMockProvisioner()
+	runner := &RunnerConfig{
+		MaxJobs: 1,
+		Docker:  &DockerImage{Image: "test:latest"},
+	}
+	s := NewScaler(noopLogger(), client, 1, 1, "test", runner, prov)
+	_, _ = s.HandleDesiredRunnerCount(context.Background(), 1)
+	time.Sleep(50 * time.Millisecond)
+	name := s.Runners()[0].Name
+	_ = s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{
+		RunnerName: name,
+		Result:     "succeeded",
+	})
+	time.Sleep(100 * time.Millisecond)
+
+	select {
+	case <-s.Drained():
+		t.Fatal("reported drained after deregistration failure")
+	default:
+	}
+	if count, err := s.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount while failed-draining: %v", err)
+	} else if count != 0 {
+		t.Fatalf("expected admission to remain closed, got %d runners", count)
 	}
 
 	s.Shutdown(context.Background())
