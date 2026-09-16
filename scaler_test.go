@@ -2,9 +2,12 @@ package outrunner
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -56,6 +59,7 @@ type mockProvisioner struct {
 	started  []string
 	stopped  []string
 	startErr error
+	stopErr  error
 	startCh  chan struct{} // if set, Start blocks until closed
 }
 
@@ -84,7 +88,7 @@ func (m *mockProvisioner) Stop(_ context.Context, name string) error {
 	m.mu.Lock()
 	m.stopped = append(m.stopped, name)
 	m.mu.Unlock()
-	return nil
+	return m.stopErr
 }
 
 func (m *mockProvisioner) Close() error { return nil }
@@ -265,6 +269,151 @@ func TestMaxJobsStopsAdmissionBeforeRunnerRemoval(t *testing.T) {
 	s.Shutdown(context.Background())
 }
 
+func TestMaxJobsWritesReceiptAfterCleanup(t *testing.T) {
+	client := newMockClient()
+	prov := newMockProvisioner()
+	receiptPath := filepath.Join(t.TempDir(), "drain-receipt.json")
+	runner := &RunnerConfig{
+		MaxJobs: 1,
+		DrainReceipt: &DrainReceiptConfig{
+			Path: receiptPath,
+			Identity: map[string]string{
+				"provider":    "gcp",
+				"instance_id": "1234",
+			},
+		},
+		Docker: &DockerImage{Image: "test:latest"},
+	}
+	s := NewScaler(noopLogger(), client, 38, 1, "receipt-test", runner, prov)
+	_, _ = s.HandleDesiredRunnerCount(context.Background(), 1)
+	time.Sleep(50 * time.Millisecond)
+	name := s.Runners()[0].Name
+	finishedAt := time.Now().UTC().Truncate(time.Second)
+	_ = s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{
+		RunnerID:   1,
+		RunnerName: name,
+		Result:     "succeeded",
+		JobMessageBase: scaleset.JobMessageBase{
+			RunnerRequestID: 99,
+			JobID:           "job-42",
+			WorkflowRunID:   123,
+			OwnerName:       "ArborealMgmt",
+			RepositoryName:  "MaynardApp",
+			FinishTime:      finishedAt,
+		},
+	})
+
+	select {
+	case <-s.Drained():
+	case <-time.After(2 * time.Second):
+		t.Fatal("scaler did not report drained")
+	}
+
+	data, err := os.ReadFile(receiptPath)
+	if err != nil {
+		t.Fatalf("read drain receipt: %v", err)
+	}
+	var receipt DrainReceipt
+	if err := json.Unmarshal(data, &receipt); err != nil {
+		t.Fatalf("parse drain receipt: %v", err)
+	}
+	if receipt.Status != "drained" || receipt.ScaleSet != "receipt-test" {
+		t.Fatalf("unexpected receipt identity: %#v", receipt)
+	}
+	if receipt.CompletedJobs != 1 || receipt.MaxJobs != 1 || len(receipt.Jobs) != 1 {
+		t.Fatalf("unexpected receipt counts: %#v", receipt)
+	}
+	if receipt.Identity["instance_id"] != "1234" || receipt.Jobs[0].JobID != "job-42" {
+		t.Fatalf("unexpected receipt detail: %#v", receipt)
+	}
+	if receipt.Jobs[0].FinishedAt != finishedAt {
+		t.Fatalf("unexpected finish time: %s", receipt.Jobs[0].FinishedAt)
+	}
+	info, err := os.Stat(receiptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("expected mode 0600, got %o", info.Mode().Perm())
+	}
+
+	s.Shutdown(context.Background())
+}
+
+func TestReceiptFailureDoesNotReportDrained(t *testing.T) {
+	client := newMockClient()
+	prov := newMockProvisioner()
+	runner := &RunnerConfig{
+		MaxJobs: 1,
+		DrainReceipt: &DrainReceiptConfig{
+			Path: filepath.Join(t.TempDir(), "directory"),
+		},
+		Docker: &DockerImage{Image: "test:latest"},
+	}
+	if err := os.Mkdir(runner.DrainReceipt.Path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s := NewScaler(noopLogger(), client, 1, 1, "test", runner, prov)
+	_, _ = s.HandleDesiredRunnerCount(context.Background(), 1)
+	time.Sleep(50 * time.Millisecond)
+	name := s.Runners()[0].Name
+	_ = s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{
+		RunnerID:   1,
+		RunnerName: name,
+		Result:     "succeeded",
+	})
+	time.Sleep(100 * time.Millisecond)
+
+	select {
+	case <-s.Drained():
+		t.Fatal("reported drained after receipt write failure")
+	default:
+	}
+	if count, err := s.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount while failed-draining: %v", err)
+	} else if count != 0 {
+		t.Fatalf("expected admission to remain closed, got %d runners", count)
+	}
+
+	s.Shutdown(context.Background())
+}
+
+func TestStopFailureDoesNotWriteReceipt(t *testing.T) {
+	client := newMockClient()
+	prov := newMockProvisioner()
+	prov.stopErr = errors.New("container still running")
+	receiptPath := filepath.Join(t.TempDir(), "drain-receipt.json")
+	runner := &RunnerConfig{
+		MaxJobs:      1,
+		DrainReceipt: &DrainReceiptConfig{Path: receiptPath},
+		Docker:       &DockerImage{Image: "test:latest"},
+	}
+	s := NewScaler(noopLogger(), client, 1, 1, "test", runner, prov)
+	_, _ = s.HandleDesiredRunnerCount(context.Background(), 1)
+	time.Sleep(50 * time.Millisecond)
+	name := s.Runners()[0].Name
+	_ = s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{
+		RunnerID:   1,
+		RunnerName: name,
+		Result:     "succeeded",
+	})
+	time.Sleep(100 * time.Millisecond)
+
+	select {
+	case <-s.Drained():
+		t.Fatal("reported drained after container stop failure")
+	default:
+	}
+	if _, err := os.Stat(receiptPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("receipt must not exist after container stop failure: %v", err)
+	}
+	if client.removeCount.Load() != 0 {
+		t.Fatalf("runner must not deregister after failed stop, got %d calls", client.removeCount.Load())
+	}
+
+	s.Shutdown(context.Background())
+}
+
 func TestDuplicateCompletionCountsOnce(t *testing.T) {
 	client := newMockClient()
 	prov := newMockProvisioner()
@@ -297,9 +446,11 @@ func TestMaxJobsDoesNotReportDrainedWhenDeregistrationFails(t *testing.T) {
 	client := newMockClient()
 	client.removeErr = errors.New("GitHub unavailable")
 	prov := newMockProvisioner()
+	receiptPath := filepath.Join(t.TempDir(), "drain-receipt.json")
 	runner := &RunnerConfig{
-		MaxJobs: 1,
-		Docker:  &DockerImage{Image: "test:latest"},
+		MaxJobs:      1,
+		DrainReceipt: &DrainReceiptConfig{Path: receiptPath},
+		Docker:       &DockerImage{Image: "test:latest"},
 	}
 	s := NewScaler(noopLogger(), client, 1, 1, "test", runner, prov)
 	_, _ = s.HandleDesiredRunnerCount(context.Background(), 1)
@@ -320,6 +471,9 @@ func TestMaxJobsDoesNotReportDrainedWhenDeregistrationFails(t *testing.T) {
 		t.Fatalf("HandleDesiredRunnerCount while failed-draining: %v", err)
 	} else if count != 0 {
 		t.Fatalf("expected admission to remain closed, got %d runners", count)
+	}
+	if _, err := os.Stat(receiptPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("receipt must not exist after deregistration failure: %v", err)
 	}
 
 	s.Shutdown(context.Background())

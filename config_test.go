@@ -245,6 +245,103 @@ runners:
 	}
 }
 
+func TestLoadConfigDrainReceipt(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := `url: https://github.com/org/repo
+runners:
+  single-use:
+    labels: [linux]
+    max_jobs: 1
+    drain_receipt:
+      path: /var/lib/outrunner/drain-receipt.json
+      identity:
+        provider: gcp
+        instance_id: "1234"
+    docker:
+      image: runner:latest
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	receipt := cfg.Runners["single-use"].DrainReceipt
+	if receipt == nil || receipt.Path != "/var/lib/outrunner/drain-receipt.json" {
+		t.Fatalf("unexpected drain receipt config: %#v", receipt)
+	}
+	if receipt.Identity["instance_id"] != "1234" {
+		t.Fatalf("unexpected drain identity: %#v", receipt.Identity)
+	}
+}
+
+func TestLoadConfigRejectsDrainReceiptWithoutMaxJobs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := `url: https://github.com/org/repo
+runners:
+  invalid:
+    labels: [linux]
+    drain_receipt:
+      path: /var/lib/outrunner/drain-receipt.json
+    docker:
+      image: runner:latest
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err == nil {
+		t.Fatal("expected drain_receipt without max_jobs to fail")
+	}
+}
+
+func TestLoadConfigRejectsRelativeDrainReceiptPath(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := `url: https://github.com/org/repo
+runners:
+  invalid:
+    labels: [linux]
+    max_jobs: 1
+    drain_receipt:
+      path: drain-receipt.json
+    docker:
+      image: runner:latest
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err == nil {
+		t.Fatal("expected relative drain_receipt path to fail")
+	}
+}
+
+func TestLoadConfigRejectsSharedDrainReceiptPath(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := `url: https://github.com/org/repo
+runners:
+  one:
+    labels: [one]
+    max_jobs: 1
+    drain_receipt: {path: /var/lib/outrunner/drain-receipt.json}
+    docker: {image: runner:latest}
+  two:
+    labels: [two]
+    max_jobs: 1
+    drain_receipt: {path: /var/lib/outrunner/drain-receipt.json}
+    docker: {image: runner:latest}
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err == nil {
+		t.Fatal("expected shared drain_receipt path to fail")
+	}
+}
+
 func TestLoadConfigRunnerCmd(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")

@@ -22,14 +22,22 @@ type Config struct {
 // URL and TokenFile are optional per-runner overrides; when empty the global
 // Config values are used.
 type RunnerConfig struct {
-	URL        string        `yaml:"url,omitempty"`
-	TokenFile  string        `yaml:"token_file,omitempty"`
-	Labels     []string      `yaml:"labels"`
-	MaxRunners int           `yaml:"max_runners,omitempty"`
-	MaxJobs    int           `yaml:"max_jobs,omitempty"`
-	Docker     *DockerImage  `yaml:"docker,omitempty"`
-	Libvirt    *LibvirtImage `yaml:"libvirt,omitempty"`
-	Tart       *TartImage    `yaml:"tart,omitempty"`
+	URL          string              `yaml:"url,omitempty"`
+	TokenFile    string              `yaml:"token_file,omitempty"`
+	Labels       []string            `yaml:"labels"`
+	MaxRunners   int                 `yaml:"max_runners,omitempty"`
+	MaxJobs      int                 `yaml:"max_jobs,omitempty"`
+	DrainReceipt *DrainReceiptConfig `yaml:"drain_receipt,omitempty"`
+	Docker       *DockerImage        `yaml:"docker,omitempty"`
+	Libvirt      *LibvirtImage       `yaml:"libvirt,omitempty"`
+	Tart         *TartImage          `yaml:"tart,omitempty"`
+}
+
+// DrainReceiptConfig writes a machine-readable receipt after max_jobs closes
+// admission and every runner is successfully stopped and deregistered.
+type DrainReceiptConfig struct {
+	Path     string            `yaml:"path"`
+	Identity map[string]string `yaml:"identity,omitempty"`
 }
 
 // DockerMount defines a bind mount for a Docker container.
@@ -111,9 +119,22 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("no runners configured (uncomment the runners section in %s)", path)
 	}
 
+	receiptPaths := make(map[string]string)
 	for name, runner := range cfg.Runners {
 		if runner.MaxJobs < 0 {
 			return nil, fmt.Errorf("runner %q: max_jobs must not be negative", name)
+		}
+		if runner.DrainReceipt != nil {
+			if runner.MaxJobs == 0 {
+				return nil, fmt.Errorf("runner %q: drain_receipt requires max_jobs", name)
+			}
+			if !filepath.IsAbs(runner.DrainReceipt.Path) {
+				return nil, fmt.Errorf("runner %q: drain_receipt path must be absolute", name)
+			}
+			if owner, exists := receiptPaths[runner.DrainReceipt.Path]; exists {
+				return nil, fmt.Errorf("runners %q and %q share a drain_receipt path", owner, name)
+			}
+			receiptPaths[runner.DrainReceipt.Path] = name
 		}
 		if len(runner.Labels) == 0 {
 			return nil, fmt.Errorf("runner %q: labels are required", name)

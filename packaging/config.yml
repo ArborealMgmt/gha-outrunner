@@ -29,6 +29,13 @@ token_file: /etc/outrunner/token
 #     labels: [self-hosted, linux]
 #     # Optional: stop admission and exit cleanly after this many completed jobs.
 #     max_jobs: 1
+#     # Optionally publish an atomic JSON receipt only after all runners are
+#     # stopped and deregistered. A write failure keeps admission closed.
+#     drain_receipt:
+#       path: /var/lib/outrunner/drain-receipt.json
+#       identity:
+#         provider: gcp
+#         instance_id: "1234567890"
 #     docker:
 #       image: ghcr.io/actions/actions-runner:latest
 #   # Example: runner targeting a different repo
