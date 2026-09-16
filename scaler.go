@@ -34,6 +34,7 @@ type Scaler struct {
 	mu               sync.Mutex
 	runners          map[string]*RunnerState
 	completedRunners map[string]bool
+	completedJobInfo []DrainJob
 	completedJobs    int
 	draining         bool
 	drainFailed      bool
@@ -138,6 +139,9 @@ func (s *Scaler) HandleJobStarted(ctx context.Context, jobInfo *scaleset.JobStar
 func (s *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCompleted) error {
 	s.logger.Info("Job completed",
 		slog.String("runnerName", jobInfo.RunnerName),
+		slog.Int64("runnerRequestId", jobInfo.RunnerRequestID),
+		slog.String("jobId", jobInfo.JobID),
+		slog.Int64("workflowRunId", jobInfo.WorkflowRunID),
 		slog.String("result", jobInfo.Result),
 	)
 
@@ -145,6 +149,16 @@ func (s *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 	state, exists := s.runners[jobInfo.RunnerName]
 	if exists && !s.completedRunners[jobInfo.RunnerName] {
 		s.completedRunners[jobInfo.RunnerName] = true
+		s.completedJobInfo = append(s.completedJobInfo, DrainJob{
+			RunnerName:      jobInfo.RunnerName,
+			RunnerID:        jobInfo.RunnerID,
+			RunnerRequestID: jobInfo.RunnerRequestID,
+			JobID:           jobInfo.JobID,
+			WorkflowRunID:   jobInfo.WorkflowRunID,
+			Repository:      jobInfo.OwnerName + "/" + jobInfo.RepositoryName,
+			Result:          jobInfo.Result,
+			FinishedAt:      jobInfo.FinishTime,
+		})
 		s.completedJobs++
 		if s.runner.MaxJobs > 0 && s.completedJobs >= s.runner.MaxJobs {
 			s.draining = true
@@ -276,15 +290,33 @@ func (s *Scaler) runRunnerLifecycle(state *RunnerState, req *RunnerRequest) {
 
 func (s *Scaler) removeRunner(name string, cleaned bool) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	delete(s.runners, name)
 	delete(s.completedRunners, name)
 	if s.draining && !cleaned {
 		s.drainFailed = true
 	}
 	if s.draining && !s.drainFailed && len(s.runners) == 0 {
+		if s.runner.DrainReceipt != nil {
+			receipt := DrainReceipt{
+				Version:       drainReceiptVersion,
+				Status:        "drained",
+				ScaleSet:      s.namePrefix,
+				CompletedJobs: s.completedJobs,
+				MaxJobs:       s.runner.MaxJobs,
+				DrainedAt:     time.Now().UTC(),
+				Identity:      s.runner.DrainReceipt.Identity,
+				Jobs:          append([]DrainJob(nil), s.completedJobInfo...),
+			}
+			if err := writeDrainReceipt(s.runner.DrainReceipt, receipt); err != nil {
+				s.drainFailed = true
+				s.logger.Error("Failed to write drain receipt", slog.String("error", err.Error()))
+				return
+			}
+			s.logger.Info("Drain receipt written", slog.String("path", s.runner.DrainReceipt.Path))
+		}
 		s.drainedOnce.Do(func() { close(s.drained) })
 	}
-	s.mu.Unlock()
 }
 
 func (s *Scaler) deregisterRunner(name string, runnerID int) bool {

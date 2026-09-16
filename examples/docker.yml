@@ -8,6 +8,14 @@ runners:
     labels: [self-hosted, linux]
     # Optional: make the host single-use and exit after safe cleanup.
     # max_jobs: 1
+    # Optionally publish an atomic JSON receipt only after all runners are
+    # stopped and deregistered. A write failure keeps admission closed and
+    # prevents the scale set from reporting drained.
+    # drain_receipt:
+    #   path: /var/lib/outrunner/drain-receipt.json
+    #   identity:
+    #     provider: gcp
+    #     instance_id: "1234567890"
     docker:
       image: outrunner-runner:latest
       # Optional: bind mount a host directory into every container.

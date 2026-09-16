@@ -74,6 +74,9 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	if err := outrunner.PrepareDrainReceipts(config); err != nil {
+		return fmt.Errorf("prepare drain receipts: %w", err)
+	}
 	logger.Info("Loaded config", slog.Int("runners", len(config.Runners)))
 
 	// Resolve (url, token) per runner and deduplicate clients.
