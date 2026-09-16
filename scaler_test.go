@@ -59,6 +59,7 @@ type mockProvisioner struct {
 	started  []string
 	stopped  []string
 	startErr error
+	stopErr  error
 	startCh  chan struct{} // if set, Start blocks until closed
 }
 
@@ -87,7 +88,7 @@ func (m *mockProvisioner) Stop(_ context.Context, name string) error {
 	m.mu.Lock()
 	m.stopped = append(m.stopped, name)
 	m.mu.Unlock()
-	return nil
+	return m.stopErr
 }
 
 func (m *mockProvisioner) Close() error { return nil }
@@ -372,6 +373,42 @@ func TestReceiptFailureDoesNotReportDrained(t *testing.T) {
 		t.Fatalf("HandleDesiredRunnerCount while failed-draining: %v", err)
 	} else if count != 0 {
 		t.Fatalf("expected admission to remain closed, got %d runners", count)
+	}
+
+	s.Shutdown(context.Background())
+}
+
+func TestStopFailureDoesNotWriteReceipt(t *testing.T) {
+	client := newMockClient()
+	prov := newMockProvisioner()
+	prov.stopErr = errors.New("container still running")
+	receiptPath := filepath.Join(t.TempDir(), "drain-receipt.json")
+	runner := &RunnerConfig{
+		MaxJobs:      1,
+		DrainReceipt: &DrainReceiptConfig{Path: receiptPath},
+		Docker:       &DockerImage{Image: "test:latest"},
+	}
+	s := NewScaler(noopLogger(), client, 1, 1, "test", runner, prov)
+	_, _ = s.HandleDesiredRunnerCount(context.Background(), 1)
+	time.Sleep(50 * time.Millisecond)
+	name := s.Runners()[0].Name
+	_ = s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{
+		RunnerID:   1,
+		RunnerName: name,
+		Result:     "succeeded",
+	})
+	time.Sleep(100 * time.Millisecond)
+
+	select {
+	case <-s.Drained():
+		t.Fatal("reported drained after container stop failure")
+	default:
+	}
+	if _, err := os.Stat(receiptPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("receipt must not exist after container stop failure: %v", err)
+	}
+	if client.removeCount.Load() != 0 {
+		t.Fatalf("runner must not deregister after failed stop, got %d calls", client.removeCount.Load())
 	}
 
 	s.Shutdown(context.Background())
