@@ -37,6 +37,7 @@ type Scaler struct {
 	completedJobInfo []DrainJob
 	completedJobs    int
 	draining         bool
+	drainReason      string
 	drainFailed      bool
 	drained          chan struct{}
 	drainedOnce      sync.Once
@@ -160,8 +161,9 @@ func (s *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 			FinishedAt:      jobInfo.FinishTime,
 		})
 		s.completedJobs++
-		if s.runner.MaxJobs > 0 && s.completedJobs >= s.runner.MaxJobs {
+		if s.runner.MaxJobs > 0 && s.completedJobs >= s.runner.MaxJobs && !s.draining {
 			s.draining = true
+			s.drainReason = "max_jobs"
 			s.logger.Info("Maximum job count reached; stopping admission",
 				slog.Int("completedJobs", s.completedJobs),
 				slog.Int("maxJobs", s.runner.MaxJobs),
@@ -174,6 +176,29 @@ func (s *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 		state.SignalDone()
 	}
 
+	return nil
+}
+
+// RequestDrain atomically closes admission. Runners already tracked are
+// allowed to finish normally; the drain receipt is published only after all
+// of them have been stopped and deregistered. If the scale set is idle, the
+// receipt is published immediately while the same mutex that admits runners
+// is held, so a desired-count message cannot race the zero-job proof.
+func (s *Scaler) RequestDrain() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.draining {
+		return nil
+	}
+	s.draining = true
+	s.drainReason = "external"
+	s.logger.Info("External drain requested; stopping admission",
+		slog.Int("trackedRunners", len(s.runners)),
+	)
+	if len(s.runners) == 0 {
+		return s.finishDrainLocked()
+	}
 	return nil
 }
 
@@ -297,26 +322,39 @@ func (s *Scaler) removeRunner(name string, cleaned bool) {
 		s.drainFailed = true
 	}
 	if s.draining && !s.drainFailed && len(s.runners) == 0 {
-		if s.runner.DrainReceipt != nil {
-			receipt := DrainReceipt{
-				Version:       drainReceiptVersion,
-				Status:        "drained",
-				ScaleSet:      s.namePrefix,
-				CompletedJobs: s.completedJobs,
-				MaxJobs:       s.runner.MaxJobs,
-				DrainedAt:     time.Now().UTC(),
-				Identity:      s.runner.DrainReceipt.Identity,
-				Jobs:          append([]DrainJob(nil), s.completedJobInfo...),
-			}
-			if err := writeDrainReceipt(s.runner.DrainReceipt, receipt); err != nil {
-				s.drainFailed = true
-				s.logger.Error("Failed to write drain receipt", slog.String("error", err.Error()))
-				return
-			}
-			s.logger.Info("Drain receipt written", slog.String("path", s.runner.DrainReceipt.Path))
-		}
-		s.drainedOnce.Do(func() { close(s.drained) })
+		_ = s.finishDrainLocked()
 	}
+}
+
+// finishDrainLocked publishes the terminal proof while s.mu is held.
+func (s *Scaler) finishDrainLocked() error {
+	if s.runner.DrainReceipt != nil {
+		version := drainReceiptVersionMaxJobs
+		reason := ""
+		if s.drainReason == "external" {
+			version = drainReceiptVersionExternal
+			reason = s.drainReason
+		}
+		receipt := DrainReceipt{
+			Version:       version,
+			Status:        "drained",
+			ScaleSet:      s.namePrefix,
+			CompletedJobs: s.completedJobs,
+			MaxJobs:       s.runner.MaxJobs,
+			DrainedAt:     time.Now().UTC(),
+			Identity:      s.runner.DrainReceipt.Identity,
+			Jobs:          append([]DrainJob(nil), s.completedJobInfo...),
+			Reason:        reason,
+		}
+		if err := writeDrainReceipt(s.runner.DrainReceipt, receipt); err != nil {
+			s.drainFailed = true
+			s.logger.Error("Failed to write drain receipt", slog.String("error", err.Error()))
+			return err
+		}
+		s.logger.Info("Drain receipt written", slog.String("path", s.runner.DrainReceipt.Path))
+	}
+	s.drainedOnce.Do(func() { close(s.drained) })
+	return nil
 }
 
 func (s *Scaler) deregisterRunner(name string, runnerID int) bool {
