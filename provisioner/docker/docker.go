@@ -101,6 +101,10 @@ func (d *Provisioner) Start(ctx context.Context, req *outrunner.RunnerRequest) e
 			ReadOnly: m.ReadOnly,
 		})
 	}
+	networkMode := container.NetworkMode("")
+	if dcfg.HostNetwork {
+		networkMode = container.NetworkMode("host")
+	}
 
 	resp, err := d.client.ContainerCreate(ctx,
 		&container.Config{
@@ -112,8 +116,9 @@ func (d *Provisioner) Start(ctx context.Context, req *outrunner.RunnerRequest) e
 			},
 		},
 		&container.HostConfig{
-			AutoRemove: true,
-			Mounts:     mounts,
+			AutoRemove:  true,
+			Mounts:      mounts,
+			NetworkMode: networkMode,
 		},
 		nil, nil, req.Name,
 	)

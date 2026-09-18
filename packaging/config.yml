@@ -38,6 +38,9 @@ token_file: /etc/outrunner/token
 #         instance_id: "1234567890"
 #     docker:
 #       image: ghcr.io/actions/actions-runner:latest
+#       # Optional: share the host network namespace so host-published ports
+#       # are reachable from jobs on localhost.
+#       # host_network: true
 #   # Example: runner targeting a different repo
 #   other-repo:
 #     url: https://github.com/your-org/other-repo

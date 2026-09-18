@@ -9,6 +9,8 @@ runners:
     max_runners: 4
     docker:
       image: outrunner-runner:latest
+      # Optional: expose host-published ports to the runner on localhost.
+      # host_network: true
       # Optional: bind-mount a host directory into every container.
       # Useful for a persistent build cache shared across ephemeral runners.
       # mounts:

@@ -38,6 +38,19 @@ docker:
       target: /opt/vcpkg-cache
 ```
 
+### Host Networking
+
+Set `host_network: true` when jobs use a mounted Docker socket to start sibling
+containers and expect their published ports to be available on `localhost`.
+The runner then shares the Docker host's network namespace. Leave this disabled
+when jobs do not require host-local service discovery.
+
+```yaml
+docker:
+  image: outrunner-runner:latest
+  host_network: true
+```
+
 ### Requirements
 
 - Docker Engine or compatible runtime

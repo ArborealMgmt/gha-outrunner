@@ -18,6 +18,10 @@ runners:
     #     instance_id: "1234567890"
     docker:
       image: outrunner-runner:latest
+      # Optional: share the host network namespace. This is useful when jobs
+      # start sibling containers through a mounted Docker socket and expect
+      # their published ports to be reachable on localhost.
+      # host_network: true
       # Optional: bind mount a host directory into every container.
       # Useful for a persistent build cache (e.g. vcpkg, cargo, gradle).
       # mounts:
