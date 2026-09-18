@@ -34,6 +34,7 @@ type Scaler struct {
 	mu               sync.Mutex
 	runners          map[string]*RunnerState
 	completedRunners map[string]bool
+	jobQueueTimes    map[string]time.Time
 	completedJobInfo []DrainJob
 	completedJobs    int
 	draining         bool
@@ -61,6 +62,7 @@ func NewScaler(logger *slog.Logger, client ScaleSetClient, scaleSetID, maxRunner
 		provisioner:      prov,
 		runners:          make(map[string]*RunnerState),
 		completedRunners: make(map[string]bool),
+		jobQueueTimes:    make(map[string]time.Time),
 		drained:          make(chan struct{}),
 		lifecycleCtx:     ctx,
 		lifecycleCancel:  cancel,
@@ -127,6 +129,9 @@ func (s *Scaler) HandleJobStarted(ctx context.Context, jobInfo *scaleset.JobStar
 	state, exists := s.runners[jobInfo.RunnerName]
 	if exists {
 		state.Phase = RunnerRunning
+		if !jobInfo.QueueTime.IsZero() {
+			s.jobQueueTimes[jobInfo.RunnerName] = jobInfo.QueueTime
+		}
 	}
 	s.mu.Unlock()
 
@@ -149,6 +154,11 @@ func (s *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 	s.mu.Lock()
 	state, exists := s.runners[jobInfo.RunnerName]
 	if exists && !s.completedRunners[jobInfo.RunnerName] {
+		queueTime := receiptQueueTime(
+			jobInfo.QueueTime,
+			s.jobQueueTimes[jobInfo.RunnerName],
+			jobInfo.ScaleSetAssignTime,
+		)
 		s.completedRunners[jobInfo.RunnerName] = true
 		s.completedJobInfo = append(s.completedJobInfo, DrainJob{
 			RunnerName:         jobInfo.RunnerName,
@@ -161,7 +171,7 @@ func (s *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 			Repository:         jobInfo.OwnerName + "/" + jobInfo.RepositoryName,
 			RequestLabels:      append([]string{}, jobInfo.RequestLabels...),
 			Result:             jobInfo.Result,
-			QueueTime:          jobInfo.QueueTime,
+			QueueTime:          queueTime,
 			ScaleSetAssignTime: jobInfo.ScaleSetAssignTime,
 			RunnerAssignTime:   jobInfo.RunnerAssignTime,
 			FinishedAt:         jobInfo.FinishTime,
@@ -183,6 +193,19 @@ func (s *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 	}
 
 	return nil
+}
+
+func receiptQueueTime(completed, started, assigned time.Time) time.Time {
+	if !completed.IsZero() {
+		return completed
+	}
+	if !started.IsZero() {
+		return started
+	}
+	// GitHub can omit queueTime from both lifecycle messages. The scale-set
+	// assignment is the latest safe queue bound and keeps the receipt's ordering
+	// proof conservative.
+	return assigned
 }
 
 // RequestDrain atomically closes admission. Runners already tracked are
@@ -324,6 +347,7 @@ func (s *Scaler) removeRunner(name string, cleaned bool) {
 	defer s.mu.Unlock()
 	delete(s.runners, name)
 	delete(s.completedRunners, name)
+	delete(s.jobQueueTimes, name)
 	if s.draining && !cleaned {
 		s.drainFailed = true
 	}
