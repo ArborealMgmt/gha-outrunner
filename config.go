@@ -65,9 +65,10 @@ type LibvirtMount struct {
 
 // DockerImage configures a Docker-based runner.
 type DockerImage struct {
-	Image     string        `yaml:"image"`
-	RunnerCmd string        `yaml:"runner_cmd"`
-	Mounts    []DockerMount `yaml:"mounts"`
+	Image       string        `yaml:"image"`
+	RunnerCmd   string        `yaml:"runner_cmd"`
+	HostNetwork bool          `yaml:"host_network,omitempty"`
+	Mounts      []DockerMount `yaml:"mounts"`
 }
 
 // LibvirtImage configures a libvirt/QEMU-based runner.

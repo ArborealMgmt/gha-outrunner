@@ -18,6 +18,7 @@ runners:
     docker:                          # Use Docker backend.
       image: <string>                # Docker image name or tag.
       runner_cmd: <string>           # Default: ./run.sh
+      host_network: <bool>           # Optional. Default: false. Use host networking.
       mounts:                        # Optional bind mounts.
         - source: <string>           # Host path.
           target: <string>           # Container path.

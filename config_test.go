@@ -452,6 +452,31 @@ runners:
 	}
 }
 
+func TestLoadConfigHostNetwork(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+
+	content := `url: https://github.com/org/repo
+runners:
+  docker-runner:
+    labels: [linux]
+    docker:
+      image: runner:latest
+      host_network: true
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if !cfg.Runners["docker-runner"].Docker.HostNetwork {
+		t.Fatal("expected host_network to be enabled")
+	}
+}
+
 func TestLoadConfigNoMounts(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
