@@ -10,20 +10,26 @@ import (
 )
 
 const (
-	drainReceiptVersionMaxJobs  = 1
+	drainReceiptVersionMaxJobs  = 3
 	drainReceiptVersionExternal = 2
 )
 
 // DrainJob identifies one completed GitHub job represented by a drain receipt.
 type DrainJob struct {
-	RunnerName      string    `json:"runner_name"`
-	RunnerID        int       `json:"runner_id"`
-	RunnerRequestID int64     `json:"runner_request_id"`
-	JobID           string    `json:"job_id"`
-	WorkflowRunID   int64     `json:"workflow_run_id"`
-	Repository      string    `json:"repository"`
-	Result          string    `json:"result"`
-	FinishedAt      time.Time `json:"finished_at"`
+	RunnerName         string    `json:"runner_name"`
+	RunnerID           int       `json:"runner_id"`
+	RunnerRequestID    int64     `json:"runner_request_id"`
+	JobID              string    `json:"job_id"`
+	JobWorkflowRef     string    `json:"job_workflow_ref"`
+	JobDisplayName     string    `json:"job_display_name"`
+	WorkflowRunID      int64     `json:"workflow_run_id"`
+	Repository         string    `json:"repository"`
+	RequestLabels      []string  `json:"request_labels"`
+	Result             string    `json:"result"`
+	QueueTime          time.Time `json:"queue_time"`
+	ScaleSetAssignTime time.Time `json:"scale_set_assign_time"`
+	RunnerAssignTime   time.Time `json:"runner_assign_time"`
+	FinishedAt         time.Time `json:"finished_at"`
 }
 
 // DrainReceipt is written only after admission is closed and all tracked

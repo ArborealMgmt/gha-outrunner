@@ -289,17 +289,26 @@ func TestMaxJobsWritesReceiptAfterCleanup(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	name := s.Runners()[0].Name
 	finishedAt := time.Now().UTC().Truncate(time.Second)
+	queueTime := finishedAt.Add(-2 * time.Minute)
+	scaleSetAssignTime := finishedAt.Add(-90 * time.Second)
+	runnerAssignTime := finishedAt.Add(-time.Minute)
 	_ = s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{
 		RunnerID:   1,
 		RunnerName: name,
 		Result:     "succeeded",
 		JobMessageBase: scaleset.JobMessageBase{
-			RunnerRequestID: 99,
-			JobID:           "job-42",
-			WorkflowRunID:   123,
-			OwnerName:       "ArborealMgmt",
-			RepositoryName:  "MaynardApp",
-			FinishTime:      finishedAt,
+			RunnerRequestID:    99,
+			JobID:              "job-42",
+			JobWorkflowRef:     "ArborealMgmt/MaynardApp/.github/workflows/tests.yml@refs/pull/1/merge",
+			JobDisplayName:     "Unit Tests (1/3)",
+			WorkflowRunID:      123,
+			OwnerName:          "ArborealMgmt",
+			RepositoryName:     "MaynardApp",
+			RequestLabels:      []string{"outrunner-gcp-linux-x64"},
+			QueueTime:          queueTime,
+			ScaleSetAssignTime: scaleSetAssignTime,
+			RunnerAssignTime:   runnerAssignTime,
+			FinishTime:         finishedAt,
 		},
 	})
 
@@ -317,7 +326,7 @@ func TestMaxJobsWritesReceiptAfterCleanup(t *testing.T) {
 	if err := json.Unmarshal(data, &receipt); err != nil {
 		t.Fatalf("parse drain receipt: %v", err)
 	}
-	if receipt.Status != "drained" || receipt.ScaleSet != "receipt-test" {
+	if receipt.Version != 3 || receipt.Status != "drained" || receipt.ScaleSet != "receipt-test" {
 		t.Fatalf("unexpected receipt identity: %#v", receipt)
 	}
 	if receipt.CompletedJobs != 1 || receipt.MaxJobs != 1 || len(receipt.Jobs) != 1 {
@@ -328,6 +337,16 @@ func TestMaxJobsWritesReceiptAfterCleanup(t *testing.T) {
 	}
 	if receipt.Jobs[0].FinishedAt != finishedAt {
 		t.Fatalf("unexpected finish time: %s", receipt.Jobs[0].FinishedAt)
+	}
+	job := receipt.Jobs[0]
+	if job.JobWorkflowRef != "ArborealMgmt/MaynardApp/.github/workflows/tests.yml@refs/pull/1/merge" ||
+		job.JobDisplayName != "Unit Tests (1/3)" ||
+		len(job.RequestLabels) != 1 || job.RequestLabels[0] != "outrunner-gcp-linux-x64" {
+		t.Fatalf("unexpected GitHub job identity: %#v", job)
+	}
+	if job.QueueTime != queueTime || job.ScaleSetAssignTime != scaleSetAssignTime ||
+		job.RunnerAssignTime != runnerAssignTime {
+		t.Fatalf("unexpected GitHub job timing: %#v", job)
 	}
 	info, err := os.Stat(receiptPath)
 	if err != nil {
@@ -450,7 +469,7 @@ func TestExternalDrainWaitsForTrackedRunner(t *testing.T) {
 	if err := json.Unmarshal(data, &receipt); err != nil {
 		t.Fatalf("parse drain receipt: %v", err)
 	}
-	if receipt.Version != 2 || receipt.Reason != "external" || receipt.CompletedJobs != 1 {
+	if receipt.Version != 3 || receipt.Reason != "external" || receipt.CompletedJobs != 1 {
 		t.Fatalf("unexpected external receipt after job: %#v", receipt)
 	}
 

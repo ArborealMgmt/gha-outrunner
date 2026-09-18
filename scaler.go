@@ -151,14 +151,20 @@ func (s *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 	if exists && !s.completedRunners[jobInfo.RunnerName] {
 		s.completedRunners[jobInfo.RunnerName] = true
 		s.completedJobInfo = append(s.completedJobInfo, DrainJob{
-			RunnerName:      jobInfo.RunnerName,
-			RunnerID:        jobInfo.RunnerID,
-			RunnerRequestID: jobInfo.RunnerRequestID,
-			JobID:           jobInfo.JobID,
-			WorkflowRunID:   jobInfo.WorkflowRunID,
-			Repository:      jobInfo.OwnerName + "/" + jobInfo.RepositoryName,
-			Result:          jobInfo.Result,
-			FinishedAt:      jobInfo.FinishTime,
+			RunnerName:         jobInfo.RunnerName,
+			RunnerID:           jobInfo.RunnerID,
+			RunnerRequestID:    jobInfo.RunnerRequestID,
+			JobID:              jobInfo.JobID,
+			JobWorkflowRef:     jobInfo.JobWorkflowRef,
+			JobDisplayName:     jobInfo.JobDisplayName,
+			WorkflowRunID:      jobInfo.WorkflowRunID,
+			Repository:         jobInfo.OwnerName + "/" + jobInfo.RepositoryName,
+			RequestLabels:      append([]string{}, jobInfo.RequestLabels...),
+			Result:             jobInfo.Result,
+			QueueTime:          jobInfo.QueueTime,
+			ScaleSetAssignTime: jobInfo.ScaleSetAssignTime,
+			RunnerAssignTime:   jobInfo.RunnerAssignTime,
+			FinishedAt:         jobInfo.FinishTime,
 		})
 		s.completedJobs++
 		if s.runner.MaxJobs > 0 && s.completedJobs >= s.runner.MaxJobs && !s.draining {
@@ -332,8 +338,10 @@ func (s *Scaler) finishDrainLocked() error {
 		version := drainReceiptVersionMaxJobs
 		reason := ""
 		if s.drainReason == "external" {
-			version = drainReceiptVersionExternal
 			reason = s.drainReason
+			if s.completedJobs == 0 {
+				version = drainReceiptVersionExternal
+			}
 		}
 		receipt := DrainReceipt{
 			Version:       version,
