@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"syscall"
 	"time"
 
 	outrunner "github.com/NetwindHQ/gha-outrunner"
@@ -45,9 +46,20 @@ Each runner definition in the config file gets its own scale set. GitHub
 routes jobs to the correct scale set based on labels.`,
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt)
+		ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 		defer cancel()
-		return run(ctx)
+		drain := make(chan struct{})
+		drainSignal := make(chan os.Signal, 1)
+		signal.Notify(drainSignal, syscall.SIGUSR1)
+		defer signal.Stop(drainSignal)
+		go func() {
+			select {
+			case <-drainSignal:
+				close(drain)
+			case <-ctx.Done():
+			}
+		}()
+		return run(ctx, drain)
 	},
 }
 
@@ -65,7 +77,7 @@ func main() {
 	}
 }
 
-func run(ctx context.Context) error {
+func run(ctx context.Context, externalDrain <-chan struct{}) error {
 	logger := slog.New(outrunner.NewSimpleHandler(os.Stdout, slog.LevelInfo))
 	listenerLogger := slog.New(outrunner.NewSimpleHandler(os.Stdout, slog.LevelWarn))
 	log.SetOutput(io.Discard)
@@ -138,7 +150,7 @@ func run(ctx context.Context) error {
 	for _, r := range resolved {
 		client := clients[r.key]
 		g.Go(func() error {
-			return runWorker(ctx, logger, listenerLogger, client, r.name, &r.runner, r.maxRunners)
+			return runWorker(ctx, externalDrain, logger, listenerLogger, client, r.name, &r.runner, r.maxRunners)
 		})
 	}
 
@@ -151,7 +163,7 @@ func run(ctx context.Context) error {
 	return nil
 }
 
-func runWorker(ctx context.Context, logger, listenerLogger *slog.Logger, client *scaleset.Client, name string, runner *outrunner.RunnerConfig, maxRunners int) error {
+func runWorker(ctx context.Context, externalDrain <-chan struct{}, logger, listenerLogger *slog.Logger, client *scaleset.Client, name string, runner *outrunner.RunnerConfig, maxRunners int) error {
 	logger = logger.With(slog.String("scaleSet", name))
 
 	// Create provisioner
@@ -232,10 +244,17 @@ func runWorker(ctx context.Context, logger, listenerLogger *slog.Logger, client 
 	defer listenerCancel()
 	go func() {
 		select {
+		case <-externalDrain:
+			if err := scaler.RequestDrain(); err != nil {
+				logger.Error("External drain failed", slog.String("error", err.Error()))
+				return
+			}
+			<-scaler.Drained()
+			logger.Info("Runner scale set drained after external request")
+			listenerCancel()
 		case <-scaler.Drained():
-			logger.Info("Runner scale set drained after maximum job count",
-				slog.Int("maxJobs", runner.MaxJobs),
-			)
+			logger.Info("Runner scale set drained",
+				slog.Int("maxJobs", runner.MaxJobs))
 			listenerCancel()
 		case <-listenerCtx.Done():
 		}

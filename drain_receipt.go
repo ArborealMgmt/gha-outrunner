@@ -9,7 +9,10 @@ import (
 	"time"
 )
 
-const drainReceiptVersion = 1
+const (
+	drainReceiptVersionMaxJobs  = 1
+	drainReceiptVersionExternal = 2
+)
 
 // DrainJob identifies one completed GitHub job represented by a drain receipt.
 type DrainJob struct {
@@ -34,6 +37,7 @@ type DrainReceipt struct {
 	DrainedAt     time.Time         `json:"drained_at"`
 	Identity      map[string]string `json:"identity,omitempty"`
 	Jobs          []DrainJob        `json:"jobs"`
+	Reason        string            `json:"reason,omitempty"`
 }
 
 // PrepareDrainReceipts removes receipts from an earlier process before any

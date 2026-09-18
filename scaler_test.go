@@ -340,6 +340,116 @@ func TestMaxJobsWritesReceiptAfterCleanup(t *testing.T) {
 	s.Shutdown(context.Background())
 }
 
+func TestExternalDrainWritesZeroJobReceiptAtomically(t *testing.T) {
+	client := newMockClient()
+	prov := newMockProvisioner()
+	receiptPath := filepath.Join(t.TempDir(), "drain-receipt.json")
+	runner := &RunnerConfig{
+		MaxJobs: 1,
+		DrainReceipt: &DrainReceiptConfig{
+			Path: receiptPath,
+			Identity: map[string]string{
+				"provider":    "gcp",
+				"instance_id": "1234",
+			},
+		},
+		Docker: &DockerImage{Image: "test:latest"},
+	}
+	s := NewScaler(noopLogger(), client, 38, 1, "receipt-test", runner, prov)
+
+	if err := s.RequestDrain(); err != nil {
+		t.Fatalf("RequestDrain: %v", err)
+	}
+	select {
+	case <-s.Drained():
+	case <-time.After(2 * time.Second):
+		t.Fatal("scaler did not report externally drained")
+	}
+	if count, err := s.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount after external drain: %v", err)
+	} else if count != 0 {
+		t.Fatalf("external drain admitted %d runners", count)
+	}
+
+	data, err := os.ReadFile(receiptPath)
+	if err != nil {
+		t.Fatalf("read drain receipt: %v", err)
+	}
+	var receipt DrainReceipt
+	if err := json.Unmarshal(data, &receipt); err != nil {
+		t.Fatalf("parse drain receipt: %v", err)
+	}
+	if receipt.Version != 2 || receipt.Reason != "external" {
+		t.Fatalf("unexpected external receipt: %#v", receipt)
+	}
+	if receipt.CompletedJobs != 0 || len(receipt.Jobs) != 0 {
+		t.Fatalf("zero-job drain recorded jobs: %#v", receipt)
+	}
+	if client.nextID != 1 {
+		t.Fatalf("zero-job drain generated a JIT runner, next ID is %d", client.nextID)
+	}
+
+	s.Shutdown(context.Background())
+}
+
+func TestExternalDrainWaitsForTrackedRunner(t *testing.T) {
+	client := newMockClient()
+	prov := newMockProvisioner()
+	receiptPath := filepath.Join(t.TempDir(), "drain-receipt.json")
+	runner := &RunnerConfig{
+		MaxJobs:      1,
+		DrainReceipt: &DrainReceiptConfig{Path: receiptPath},
+		Docker:       &DockerImage{Image: "test:latest"},
+	}
+	s := NewScaler(noopLogger(), client, 38, 1, "receipt-test", runner, prov)
+	if _, err := s.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	name := s.Runners()[0].Name
+
+	if err := s.RequestDrain(); err != nil {
+		t.Fatalf("RequestDrain: %v", err)
+	}
+	select {
+	case <-s.Drained():
+		t.Fatal("external drain completed before tracked runner cleanup")
+	default:
+	}
+	if count, err := s.HandleDesiredRunnerCount(context.Background(), 2); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount while externally draining: %v", err)
+	} else if count != 1 {
+		t.Fatalf("expected only tracked runner while draining, got %d", count)
+	}
+
+	if err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{
+		RunnerID:   1,
+		RunnerName: name,
+		Result:     "succeeded",
+	}); err != nil {
+		t.Fatalf("HandleJobCompleted: %v", err)
+	}
+	select {
+	case <-s.Drained():
+	case <-time.After(2 * time.Second):
+		t.Fatal("external drain did not finish after tracked runner cleanup")
+	}
+
+	data, err := os.ReadFile(receiptPath)
+	if err != nil {
+		t.Fatalf("read drain receipt: %v", err)
+	}
+	var receipt DrainReceipt
+	if err := json.Unmarshal(data, &receipt); err != nil {
+		t.Fatalf("parse drain receipt: %v", err)
+	}
+	if receipt.Version != 2 || receipt.Reason != "external" || receipt.CompletedJobs != 1 {
+		t.Fatalf("unexpected external receipt after job: %#v", receipt)
+	}
+
+	s.Shutdown(context.Background())
+}
+
 func TestReceiptFailureDoesNotReportDrained(t *testing.T) {
 	client := newMockClient()
 	prov := newMockProvisioner()
