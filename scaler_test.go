@@ -292,6 +292,13 @@ func TestMaxJobsWritesReceiptAfterCleanup(t *testing.T) {
 	queueTime := finishedAt.Add(-2 * time.Minute)
 	scaleSetAssignTime := finishedAt.Add(-90 * time.Second)
 	runnerAssignTime := finishedAt.Add(-time.Minute)
+	_ = s.HandleJobStarted(context.Background(), &scaleset.JobStarted{
+		RunnerID:   1,
+		RunnerName: name,
+		JobMessageBase: scaleset.JobMessageBase{
+			QueueTime: queueTime,
+		},
+	})
 	_ = s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{
 		RunnerID:   1,
 		RunnerName: name,
@@ -305,7 +312,6 @@ func TestMaxJobsWritesReceiptAfterCleanup(t *testing.T) {
 			OwnerName:          "ArborealMgmt",
 			RepositoryName:     "MaynardApp",
 			RequestLabels:      []string{"outrunner-gcp-linux-x64"},
-			QueueTime:          queueTime,
 			ScaleSetAssignTime: scaleSetAssignTime,
 			RunnerAssignTime:   runnerAssignTime,
 			FinishTime:         finishedAt,
@@ -357,6 +363,30 @@ func TestMaxJobsWritesReceiptAfterCleanup(t *testing.T) {
 	}
 
 	s.Shutdown(context.Background())
+}
+
+func TestReceiptQueueTimeUsesConservativeAvailableBound(t *testing.T) {
+	completed := time.Date(2026, 9, 18, 15, 0, 0, 0, time.UTC)
+	started := completed.Add(time.Second)
+	assigned := started.Add(time.Second)
+	cases := []struct {
+		name      string
+		completed time.Time
+		started   time.Time
+		expected  time.Time
+	}{
+		{name: "completed message", completed: completed, started: started, expected: completed},
+		{name: "started message", started: started, expected: started},
+		{name: "assignment fallback", expected: assigned},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			actual := receiptQueueTime(tc.completed, tc.started, assigned)
+			if actual != tc.expected {
+				t.Fatalf("expected %s, got %s", tc.expected, actual)
+			}
+		})
+	}
 }
 
 func TestExternalDrainWritesZeroJobReceiptAtomically(t *testing.T) {
