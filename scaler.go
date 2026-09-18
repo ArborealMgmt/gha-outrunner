@@ -343,7 +343,7 @@ func (s *Scaler) finishDrainLocked() error {
 			MaxJobs:       s.runner.MaxJobs,
 			DrainedAt:     time.Now().UTC(),
 			Identity:      s.runner.DrainReceipt.Identity,
-			Jobs:          append([]DrainJob(nil), s.completedJobInfo...),
+			Jobs:          append([]DrainJob{}, s.completedJobInfo...),
 			Reason:        reason,
 		}
 		if err := writeDrainReceipt(s.runner.DrainReceipt, receipt); err != nil {

@@ -385,6 +385,13 @@ func TestExternalDrainWritesZeroJobReceiptAtomically(t *testing.T) {
 	if receipt.CompletedJobs != 0 || len(receipt.Jobs) != 0 {
 		t.Fatalf("zero-job drain recorded jobs: %#v", receipt)
 	}
+	var rawReceipt map[string]any
+	if err := json.Unmarshal(data, &rawReceipt); err != nil {
+		t.Fatalf("parse raw drain receipt: %v", err)
+	}
+	if jobs, ok := rawReceipt["jobs"].([]any); !ok || len(jobs) != 0 {
+		t.Fatalf("zero-job drain must encode jobs as an empty array, got %#v", rawReceipt["jobs"])
+	}
 	if client.nextID != 1 {
 		t.Fatalf("zero-job drain generated a JIT runner, next ID is %d", client.nextID)
 	}
