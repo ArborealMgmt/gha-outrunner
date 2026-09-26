@@ -14,6 +14,7 @@ runners:
     token_file: <string>             # Optional per-runner token file override.
     labels: [<string>, ...]          # Labels registered on this scale set.
     max_runners: <int>               # Optional. Defaults to --max-runners flag.
+    idle_drain_after: <duration>     # Optional. Idle linger, e.g. 5m; 0s disables.
     max_jobs: <int>                  # Optional. Stop admission after N completed jobs.
     docker:                          # Use Docker backend.
       image: <string>                # Docker image name or tag.
@@ -122,6 +123,20 @@ jobs:
 exit cleanly. The default `0` is unlimited. `max_jobs: 1` with `max_runners: 1` provides a single-use host contract:
 job completion closes admission atomically before the finished runner is removed, so a concurrent desired-count
 message cannot create replacement work on the draining host.
+
+### `runners.<name>.idle_drain_after`
+
+**Optional.** A nonnegative duration such as `5m`; the default `0s` disables idle drain.
+The idle clock starts after scale-set registration, so a host with no jobs also retires.
+Each completed job restarts the clock. Provisioning, idle JIT runners, running jobs, and
+cleanup all prevent idle drain; admission closes atomically under the scaler mutex only
+when no runner remains. Failed cleanup prevents a successful receipt.
+
+On expiry, Outrunner writes the configured drain receipt with `reason: "idle"` (version 2
+for zero jobs, version 3 otherwise) and exits successfully. The existing systemd
+`ExecStopPost` publisher can copy the receipt to guest attributes. No host poweroff is
+issued: the VM remains up until its broker verifies the receipt and deletes it.
+`max_jobs` and SIGUSR1 still provide independent forced-drain paths.
 
 ### `runners.<name>.docker`
 

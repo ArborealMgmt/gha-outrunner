@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -22,15 +23,16 @@ type Config struct {
 // URL and TokenFile are optional per-runner overrides; when empty the global
 // Config values are used.
 type RunnerConfig struct {
-	URL          string              `yaml:"url,omitempty"`
-	TokenFile    string              `yaml:"token_file,omitempty"`
-	Labels       []string            `yaml:"labels"`
-	MaxRunners   int                 `yaml:"max_runners,omitempty"`
-	MaxJobs      int                 `yaml:"max_jobs,omitempty"`
-	DrainReceipt *DrainReceiptConfig `yaml:"drain_receipt,omitempty"`
-	Docker       *DockerImage        `yaml:"docker,omitempty"`
-	Libvirt      *LibvirtImage       `yaml:"libvirt,omitempty"`
-	Tart         *TartImage          `yaml:"tart,omitempty"`
+	URL            string              `yaml:"url,omitempty"`
+	TokenFile      string              `yaml:"token_file,omitempty"`
+	Labels         []string            `yaml:"labels"`
+	MaxRunners     int                 `yaml:"max_runners,omitempty"`
+	IdleDrainAfter time.Duration       `yaml:"idle_drain_after,omitempty"`
+	MaxJobs        int                 `yaml:"max_jobs,omitempty"`
+	DrainReceipt   *DrainReceiptConfig `yaml:"drain_receipt,omitempty"`
+	Docker         *DockerImage        `yaml:"docker,omitempty"`
+	Libvirt        *LibvirtImage       `yaml:"libvirt,omitempty"`
+	Tart           *TartImage          `yaml:"tart,omitempty"`
 }
 
 // DrainReceiptConfig writes a machine-readable receipt after max_jobs closes
@@ -122,6 +124,9 @@ func LoadConfig(path string) (*Config, error) {
 
 	receiptPaths := make(map[string]string)
 	for name, runner := range cfg.Runners {
+		if runner.IdleDrainAfter < 0 {
+			return nil, fmt.Errorf("runner %q: idle_drain_after must not be negative", name)
+		}
 		if runner.MaxJobs < 0 {
 			return nil, fmt.Errorf("runner %q: max_jobs must not be negative", name)
 		}
