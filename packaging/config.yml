@@ -29,6 +29,7 @@ token_file: /etc/outrunner/token
 #     labels: [self-hosted, linux]
 #     # Optional: stop admission and exit cleanly after this many completed jobs.
 #     max_jobs: 1
+#     idle_drain_after: 5m # Optional; 0s disables guest-owned idle drain.
 #     # Optionally publish an atomic JSON receipt only after all runners are
 #     # stopped and deregistered. A write failure keeps admission closed.
 #     drain_receipt:

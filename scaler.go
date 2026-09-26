@@ -42,6 +42,8 @@ type Scaler struct {
 	drainFailed      bool
 	drained          chan struct{}
 	drainedOnce      sync.Once
+	idleSince        time.Time
+	idleTimer        *time.Timer
 
 	lifecycleCtx    context.Context
 	lifecycleCancel context.CancelFunc
@@ -52,7 +54,7 @@ var _ listener.Scaler = (*Scaler)(nil)
 
 func NewScaler(logger *slog.Logger, client ScaleSetClient, scaleSetID, maxRunners int, namePrefix string, runner *RunnerConfig, prov Provisioner) *Scaler {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Scaler{
+	s := &Scaler{
 		logger:           logger,
 		client:           client,
 		scaleSetID:       scaleSetID,
@@ -66,7 +68,13 @@ func NewScaler(logger *slog.Logger, client ScaleSetClient, scaleSetID, maxRunner
 		drained:          make(chan struct{}),
 		lifecycleCtx:     ctx,
 		lifecycleCancel:  cancel,
+		idleSince:        time.Now(),
 	}
+	// NewScaler is called after scale-set registration, including on zero-job hosts.
+	s.mu.Lock()
+	s.armIdleTimerLocked()
+	s.mu.Unlock()
+	return s
 }
 
 func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, error) {
@@ -177,6 +185,7 @@ func (s *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 			FinishedAt:         jobInfo.FinishTime,
 		})
 		s.completedJobs++
+		s.idleSince = time.Now()
 		if s.runner.MaxJobs > 0 && s.completedJobs >= s.runner.MaxJobs && !s.draining {
 			s.draining = true
 			s.drainReason = "max_jobs"
@@ -231,15 +240,51 @@ func (s *Scaler) RequestDrain() error {
 	return nil
 }
 
-// Drained closes after max_jobs has stopped admission and every tracked runner
-// has been stopped and deregistered. It never closes when max_jobs is zero.
+// armIdleTimerLocked starts or resumes the remaining linger interval. Callers
+// hold s.mu, the same lock used for admission and the terminal idle decision.
+func (s *Scaler) armIdleTimerLocked() {
+	if s.runner.IdleDrainAfter <= 0 || s.draining || s.drainFailed || s.lifecycleCtx.Err() != nil || len(s.runners) != 0 {
+		return
+	}
+	remaining := max(time.Duration(0), s.runner.IdleDrainAfter-time.Since(s.idleSince))
+	if s.idleTimer != nil {
+		s.idleTimer.Stop()
+	}
+	s.idleTimer = time.AfterFunc(remaining, s.checkIdleDrain)
+}
+
+func (s *Scaler) checkIdleDrain() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.runner.IdleDrainAfter <= 0 || s.draining || s.drainFailed || s.lifecycleCtx.Err() != nil || len(s.runners) != 0 {
+		return
+	}
+	// A previously scheduled callback may race a new job and its cleanup.
+	// Always check the current clock under the admission lock.
+	if time.Since(s.idleSince) < s.runner.IdleDrainAfter {
+		s.armIdleTimerLocked()
+		return
+	}
+	s.draining = true
+	s.drainReason = "idle"
+	s.logger.Info("Idle linger expired; stopping admission")
+	_ = s.finishDrainLocked()
+}
+
+// Drained closes after admission stops and every tracked runner has been
+// successfully stopped and deregistered, with any configured receipt durable.
 func (s *Scaler) Drained() <-chan struct{} {
 	return s.drained
 }
 
 // Shutdown cancels all runner goroutines and waits for them to finish.
 func (s *Scaler) Shutdown(ctx context.Context) {
+	s.mu.Lock()
 	s.lifecycleCancel()
+	if s.idleTimer != nil {
+		s.idleTimer.Stop()
+	}
+	s.mu.Unlock()
 
 	done := make(chan struct{})
 	go func() {
@@ -348,9 +393,10 @@ func (s *Scaler) removeRunner(name string, cleaned bool) {
 	delete(s.runners, name)
 	delete(s.completedRunners, name)
 	delete(s.jobQueueTimes, name)
-	if s.draining && !cleaned {
+	if !cleaned {
 		s.drainFailed = true
 	}
+	s.armIdleTimerLocked()
 	if s.draining && !s.drainFailed && len(s.runners) == 0 {
 		_ = s.finishDrainLocked()
 	}
@@ -358,10 +404,13 @@ func (s *Scaler) removeRunner(name string, cleaned bool) {
 
 // finishDrainLocked publishes the terminal proof while s.mu is held.
 func (s *Scaler) finishDrainLocked() error {
+	if s.drainFailed {
+		return fmt.Errorf("drain cannot prove successful cleanup")
+	}
 	if s.runner.DrainReceipt != nil {
 		version := drainReceiptVersionMaxJobs
 		reason := ""
-		if s.drainReason == "external" {
+		if s.drainReason == "external" || s.drainReason == "idle" {
 			reason = s.drainReason
 			if s.completedJobs == 0 {
 				version = drainReceiptVersionExternal

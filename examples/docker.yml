@@ -8,6 +8,7 @@ runners:
     labels: [self-hosted, linux]
     # Optional: make the host single-use and exit after safe cleanup.
     # max_jobs: 1
+    # idle_drain_after: 5m # Optional; 0s disables guest-owned idle drain.
     # Optionally publish an atomic JSON receipt only after all runners are
     # stopped and deregistered. A write failure keeps admission closed and
     # prevents the scale set from reporting drained.

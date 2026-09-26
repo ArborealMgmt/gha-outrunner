@@ -34,6 +34,13 @@ FORMULA=$(echo "$FORMULA" | awk -v sha="$SHA_DARWIN_ARM64" '/sha256/ && !a++ {su
 FORMULA=$(echo "$FORMULA" | awk -v sha="$SHA_LINUX_AMD64" '/sha256/ && ++c==2 {sub(/sha256 "[a-f0-9]+"/, "sha256 \"" sha "\"")} 1')
 FORMULA=$(echo "$FORMULA" | awk -v sha="$SHA_LINUX_ARM64" '/sha256/ && ++c==3 {sub(/sha256 "[a-f0-9]+"/, "sha256 \"" sha "\"")} 1')
 
+# Keep the generated Homebrew config aligned with the optional runner schema.
+# Leave the value commented so upgrading does not enable idle drain.
+if ! grep -q 'idle_drain_after:' <<<"$FORMULA"; then
+  FORMULA=$(printf '%s\n' "$FORMULA" | sed '/#     labels:/a\
+        #     idle_drain_after: 5m # Optional; 0s disables guest-owned idle drain.')
+fi
+
 # Push updated formula
 CONTENT=$(echo "$FORMULA" | base64 | tr -d '\n')
 gh api -X PUT repos/NetwindHQ/homebrew-tap/contents/Formula/outrunner.rb \
