@@ -3,7 +3,7 @@ package docker
 import (
 	"context"
 	"fmt"
-	"github.com/docker/docker/errdefs"
+	"github.com/containerd/errdefs"
 	"io"
 	"log/slog"
 	"os"
@@ -190,6 +190,8 @@ func (d *Provisioner) Stop(ctx context.Context, name string) error {
 }
 
 func (d *Provisioner) preserveLogs(ctx context.Context, name string) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	cache, err := os.UserCacheDir()
 	if err != nil {
 		return
@@ -237,22 +239,31 @@ func (d *Provisioner) preserveLogs(ctx context.Context, name string) {
 
 // Cleanup removes retained environments from a prior process using both our
 // ownership label and the exact scale-set name prefix.
-func (d *Provisioner) Cleanup(prefix string) {
+func (d *Provisioner) Cleanup(prefix string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	containers, err := d.client.ContainerList(ctx, container.ListOptions{All: true, Filters: filters.NewArgs(filters.Arg("label", "outrunner=true"))})
 	if err != nil {
-		d.logger.Error("Cannot list orphan containers", slog.Any("error", err))
-		return
+		return fmt.Errorf("list orphan containers: %w", err)
 	}
 	for _, item := range containers {
 		name := item.Labels["outrunner.name"]
-		if strings.HasPrefix(name, prefix) {
-			if err := d.Stop(ctx, name); err != nil {
-				d.logger.Error("Cannot clean up orphan container", slog.String("name", name), slog.Any("error", err))
-			}
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		if item.State != "exited" && item.State != "dead" && item.State != "created" {
+			// A process restart must not abort a job that survived it. Refuse
+			// new admission and drain proof until the old environment exits.
+			return fmt.Errorf("orphan container %s is still %s", name, item.State)
+		}
+		d.preserveLogs(ctx, name)
+		// Never call Stop or force removal here: the state can change after
+		// listing, and Docker must reject removal if it is running again.
+		if err := d.client.ContainerRemove(ctx, name, container.RemoveOptions{RemoveVolumes: true}); err != nil && !errdefs.IsNotFound(err) {
+			return fmt.Errorf("remove orphan container %s: %w", name, err)
 		}
 	}
+	return nil
 }
 
 func (d *Provisioner) Close() error {

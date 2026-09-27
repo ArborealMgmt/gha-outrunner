@@ -174,7 +174,9 @@ func runWorker(ctx context.Context, externalDrain <-chan struct{}, logger, liste
 	defer func() { _ = prov.Close() }()
 
 	// Clean up orphans from previous runs
-	cleanupOrphans(logger, prov, name)
+	if err := cleanupOrphans(logger, prov, name); err != nil {
+		return fmt.Errorf("runner %s: recover orphans: %w", name, err)
+	}
 
 	// Build labels
 	var labels []scaleset.Label
@@ -321,12 +323,16 @@ func labelsMatch(existing []scaleset.Label, desired []scaleset.Label) bool {
 }
 
 // cleanupOrphans removes leftover resources from previous runs.
-func cleanupOrphans(logger *slog.Logger, prov outrunner.Provisioner, name string) {
+func cleanupOrphans(logger *slog.Logger, prov outrunner.Provisioner, name string) error {
 	prefix := name + "-"
+	if c, ok := prov.(interface{ Cleanup(string) error }); ok {
+		return c.Cleanup(prefix)
+	}
 	type cleaner interface {
 		Cleanup(prefix string)
 	}
 	if c, ok := prov.(cleaner); ok {
 		c.Cleanup(prefix)
 	}
+	return nil
 }

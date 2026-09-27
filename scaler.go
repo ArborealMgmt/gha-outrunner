@@ -2,6 +2,7 @@ package outrunner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -46,6 +47,7 @@ type Scaler struct {
 	idleSince        time.Time
 	idleTimer        *time.Timer
 	exitGrace        time.Duration
+	cleanupRetry     time.Duration
 
 	lifecycleCtx    context.Context
 	lifecycleCancel context.CancelFunc
@@ -73,6 +75,7 @@ func NewScaler(logger *slog.Logger, client ScaleSetClient, scaleSetID, maxRunner
 		lifecycleCancel:  cancel,
 		idleSince:        time.Now(),
 		exitGrace:        30 * time.Second,
+		cleanupRetry:     time.Second,
 	}
 	// NewScaler is called after scale-set registration, including on zero-job hosts.
 	s.mu.Lock()
@@ -165,6 +168,10 @@ func (s *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 
 	s.mu.Lock()
 	state, exists := s.runners[jobInfo.RunnerName]
+	if !exists && jobInfo.RunnerName != "" {
+		s.logger.Warn("Completion received for untracked runner; receipt accounting may be incomplete",
+			slog.String("runnerName", jobInfo.RunnerName), slog.Int64("workflowRunId", jobInfo.WorkflowRunID))
+	}
 	if exists && !s.completedRunners[jobInfo.RunnerName] {
 		queueTime := receiptQueueTime(
 			jobInfo.QueueTime,
@@ -356,15 +363,8 @@ func (s *Scaler) runRunnerLifecycle(state *RunnerState, req *RunnerRequest) {
 			slog.String("name", name),
 			slog.String("error", err.Error()),
 		)
-		// Start may have created an environment before failing. Prove teardown
-		// before deregistering or allowing a drain receipt.
-		stopCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		defer cancel()
-		if err := s.provisioner.Stop(stopCtx, name); err != nil {
-			s.logger.Error("Failed to clean up partial start", slog.String("name", name), slog.Any("error", err))
-			return
-		}
-		cleaned = s.deregisterRunner(name, state.RunnerID)
+		// Start can fail after creation. Keep ownership until cleanup is proven.
+		cleaned = s.cleanupRunner(state)
 		return
 	}
 
@@ -427,24 +427,34 @@ func (s *Scaler) runRunnerLifecycle(state *RunnerState, req *RunnerRequest) {
 	watchCancel()
 	<-watchDone
 
-	// 3. Stop
+	cleaned = s.cleanupRunner(state)
+}
+
+// Keep failed cleanup tracked and retry transient Docker/GitHub failures. Only
+// shutdown can abandon the proof, in which case removeRunner fails the drain.
+func (s *Scaler) cleanupRunner(state *RunnerState) bool {
 	s.mu.Lock()
 	state.Phase = RunnerStopping
 	s.mu.Unlock()
-
-	s.logger.Info("Stopping runner", slog.String("name", name))
-	stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer stopCancel()
-	if err := s.provisioner.Stop(stopCtx, name); err != nil {
-		s.logger.Error("Failed to stop runner",
-			slog.String("name", name),
-			slog.String("error", err.Error()),
-		)
-		return
+	delay := s.cleanupRetry
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		err := s.provisioner.Stop(ctx, state.Name)
+		cancel()
+		if err == nil && s.deregisterRunner(state.Name, state.RunnerID) {
+			return true
+		}
+		s.logger.Warn("Runner cleanup incomplete; retaining ownership for retry",
+			slog.String("name", state.Name), slog.Any("error", err))
+		timer := time.NewTimer(delay)
+		select {
+		case <-s.lifecycleCtx.Done():
+			timer.Stop()
+			return false
+		case <-timer.C:
+		}
+		delay = min(30*time.Second, delay*2)
 	}
-
-	// 4. Deregister from GitHub
-	cleaned = s.deregisterRunner(name, state.RunnerID)
 }
 
 func (s *Scaler) removeRunner(name string, cleaned bool) {
@@ -504,7 +514,7 @@ func (s *Scaler) deregisterRunner(name string, runnerID int) bool {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := s.client.RemoveRunner(ctx, int64(runnerID)); err != nil {
+	if err := s.client.RemoveRunner(ctx, int64(runnerID)); err != nil && !errors.Is(err, scaleset.RunnerNotFoundError) {
 		s.logger.Warn("Failed to deregister runner",
 			slog.String("name", name),
 			slog.Int("runnerID", runnerID),

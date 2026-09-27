@@ -636,8 +636,8 @@ func TestMaxJobsDoesNotReportDrainedWhenDeregistrationFails(t *testing.T) {
 	}
 	if count, err := s.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
 		t.Fatalf("HandleDesiredRunnerCount while failed-draining: %v", err)
-	} else if count != 0 {
-		t.Fatalf("expected admission to remain closed, got %d runners", count)
+	} else if count != 1 {
+		t.Fatalf("expected failed runner to remain tracked, got %d runners", count)
 	}
 	if _, err := os.Stat(receiptPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("receipt must not exist after deregistration failure: %v", err)
@@ -1043,6 +1043,9 @@ func TestExitedContainerDoesNotStrandDrain(t *testing.T) {
 				t.Fatal(err)
 			}
 			close(prov.exit) // no JobStarted or JobCompleted will ever arrive
+			if stopFails {
+				s.lifecycleCancel()
+			}
 			done := make(chan struct{})
 			go func() { s.wg.Wait(); close(done) }()
 			select {
@@ -1078,6 +1081,7 @@ func TestPartialStartFailureRequiresCleanup(t *testing.T) {
 	s := newTestScaler(client, prov)
 	defer s.Shutdown(context.Background())
 	_, _ = s.HandleDesiredRunnerCount(context.Background(), 1)
+	s.lifecycleCancel()
 	s.wg.Wait()
 	if len(prov.stoppedNames()) != 1 {
 		t.Fatal("partial start was not cleaned up")
@@ -1120,5 +1124,35 @@ func TestDrainClosesAdmissionBeforeRunnerCleanup(t *testing.T) {
 				t.Fatalf("admitted replacement while draining: %d %v", count, err)
 			}
 		})
+	}
+}
+
+type transientStopProvisioner struct {
+	*mockProvisioner
+	attempts atomic.Int32
+}
+
+func (p *transientStopProvisioner) Stop(ctx context.Context, name string) error {
+	if p.attempts.Add(1) == 1 {
+		return errors.New("temporary Docker failure")
+	}
+	return p.mockProvisioner.Stop(ctx, name)
+}
+func TestTransientCleanupFailureRecoversWithoutLosingDrainProof(t *testing.T) {
+	prov := &transientStopProvisioner{mockProvisioner: newMockProvisioner()}
+	s := newTestScaler(newMockClient(), prov)
+	s.cleanupRetry = time.Millisecond
+	defer s.Shutdown(context.Background())
+	_, _ = s.HandleDesiredRunnerCount(context.Background(), 1)
+	name := s.Runners()[0].Name
+	_ = s.RequestDrain()
+	_ = s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: name})
+	select {
+	case <-s.Drained():
+	case <-time.After(time.Second):
+		t.Fatal("transient cleanup failure wedged drain")
+	}
+	if prov.attempts.Load() != 2 {
+		t.Fatal("cleanup did not retry")
 	}
 }

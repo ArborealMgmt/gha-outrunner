@@ -129,8 +129,16 @@ func TestIdleDrainFailureBeforeDeadlineSuppressesReceipt(t *testing.T) {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("receipt exists: %v", err)
 		}
-		if err := s.RequestDrain(); err == nil {
-			t.Fatal("external drain lost earlier cleanup failure")
+		if err := s.RequestDrain(); err != nil {
+			t.Fatal(err)
+		}
+		if len(s.Runners()) != 1 {
+			t.Fatal("failed cleanup lost ownership")
+		}
+		select {
+		case <-s.Drained():
+			t.Fatal("external drain bypassed pending cleanup")
+		default:
 		}
 	})
 }
