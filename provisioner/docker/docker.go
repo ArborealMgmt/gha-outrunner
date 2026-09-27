@@ -9,7 +9,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	outrunner "github.com/NetwindHQ/gha-outrunner"
@@ -20,6 +22,8 @@ import (
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/client"
 )
+
+var diagnosticsMu sync.Mutex
 
 // Provisioner creates ephemeral Docker containers as GitHub Actions runners.
 type Provisioner struct {
@@ -121,7 +125,7 @@ func (d *Provisioner) Start(ctx context.Context, req *outrunner.RunnerRequest) e
 		},
 		&container.HostConfig{
 			AutoRemove:  false,
-			LogConfig:   container.LogConfig{Type: "local", Config: map[string]string{"max-size": "1m", "max-file": "2"}},
+			LogConfig:   container.LogConfig{Type: "json-file", Config: map[string]string{"max-size": "1m", "max-file": "2"}},
 			Mounts:      mounts,
 			NetworkMode: networkMode,
 		},
@@ -172,7 +176,9 @@ func (d *Provisioner) Wait(ctx context.Context, name string) error {
 func (d *Provisioner) Stop(ctx context.Context, name string) error {
 	d.logger.Debug("Stopping container", slog.String("name", name))
 	if err := d.client.ContainerStop(ctx, name, container.StopOptions{}); err != nil && !errdefs.IsNotFound(err) && !errdefs.IsNotModified(err) {
-		return fmt.Errorf("stop container: %w", err)
+		// A stop response can fail after the daemon stopped the container.
+		// Non-forced removal below is the final proof: it refuses a live one.
+		d.logger.Warn("Container stop failed; checking removal", slog.String("name", name), slog.Any("error", err))
 	}
 	// Retain bounded diagnostics outside the disposable container, with private
 	// permissions. Do not print job output or JIT material into the journal.
@@ -192,25 +198,40 @@ func (d *Provisioner) preserveLogs(ctx context.Context, name string) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return
 	}
-	// One fixed-size slot per runner name hash bounds disk use across restarts.
-	// Only this process's own runner names enter the path.
-	var slot uint32
-	for _, b := range []byte(name) {
-		slot = slot*31 + uint32(b)
-	}
-	path := filepath.Join(dir, fmt.Sprintf("container-%02d.log", slot%32))
+	diagnosticsMu.Lock()
+	defer diagnosticsMu.Unlock()
 	reader, err := d.client.ContainerLogs(ctx, name, container.LogsOptions{ShowStdout: true, ShowStderr: true, Tail: "200"})
 	if err != nil {
 		return
 	}
 	defer func() { _ = reader.Close() }()
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	file, err := os.CreateTemp(dir, "container-*.log")
 	if err != nil {
 		return
 	}
 	defer func() { _ = file.Close() }()
 	_, _ = fmt.Fprintf(file, "runner=%s\n", name)
 	_, _ = io.Copy(file, io.LimitReader(reader, 64*1024))
+	path := file.Name()
+	// Keep the latest 32 records across all scale sets. Unique files and a
+	// process-wide lock avoid overwriting simultaneous failures by hash collision.
+	entries, err := os.ReadDir(dir)
+	if err == nil {
+		var records []os.FileInfo
+		for _, entry := range entries {
+			if !entry.IsDir() && strings.HasPrefix(entry.Name(), "container-") && strings.HasSuffix(entry.Name(), ".log") {
+				if info, err := entry.Info(); err == nil {
+					records = append(records, info)
+				}
+			}
+		}
+		sort.Slice(records, func(i, j int) bool { return records[i].ModTime().Before(records[j].ModTime()) })
+		for _, record := range records[:max(0, len(records)-32)] {
+			if err := os.Remove(filepath.Join(dir, record.Name())); err != nil {
+				d.logger.Warn("Cannot prune old diagnostics", slog.Any("error", err))
+			}
+		}
+	}
 	d.logger.Info("Container diagnostics retained", slog.String("name", name), slog.String("path", path))
 }
 

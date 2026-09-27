@@ -87,7 +87,7 @@ have succeeded before startup failed.
 
 Docker logs are limited to two 1 MiB files. Before removal, the last 200 lines
 (up to 64 KiB) are copied to private files under
-`$XDG_CACHE_HOME/outrunner/diagnostics` (32 bounded slots). The systemd package
+`$XDG_CACHE_HOME/outrunner/diagnostics` (the latest 32 records across all scale sets). The systemd package
 provides a writable cache directory. Exit codes and OOM status go to the journal;
 job output remains in those private diagnostic files. Old containers bearing this
 scale set's ownership labels are cleaned up on restart.
