@@ -75,8 +75,14 @@ Built by [Paweł Subocz](https://x.com/psubocz) at [Netwind](https://netwind.pl)
 
 ### Docker exit recovery
 
-A draining listener advertises zero capacity immediately while existing runners
-finish, so it cannot acquire assignments that the scaler will refuse to launch.
+A draining listener advertises zero capacity on its next poll and waits for that
+poll to succeed and be processed before publishing a drain receipt. Assignments
+accepted by an earlier in-flight poll are still served. Terminal proof requires
+both zero outstanding GitHub assignments and successful cleanup of every local
+runner. Version 4 receipts record the drain reason (`max_jobs`, `external`, or
+`idle`); `max_jobs` is a threshold, so finishing already accepted assignments can
+increase the final completed count beyond it. Controllers must support version 4
+before this runtime is deployed.
 Docker environments are retained until the scaler cleans them up. An exit watcher
 inspects their state every two seconds, including exits that race startup. After
 an exit, the scaler gives GitHub up to 30 seconds to deliver the real completion
