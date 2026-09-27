@@ -33,3 +33,9 @@ type Provisioner interface {
 	// Close releases any resources held by the provisioner (e.g., Docker client).
 	Close() error
 }
+
+// ExitWatcher is optional. Wait returns only after the environment has exited
+// (nil), or its state cannot be established (error). It must honor cancellation.
+type ExitWatcher interface {
+	Wait(ctx context.Context, name string) error
+}

@@ -72,3 +72,24 @@ Using outrunner? [Open a PR](https://github.com/NetwindHQ/gha-outrunner/edit/mai
 ## Author
 
 Built by [Paweł Subocz](https://x.com/psubocz) at [Netwind](https://netwind.pl).
+
+### Docker exit recovery
+
+Docker environments are retained until the scaler cleans them up. An exit watcher
+inspects their state every two seconds, including exits that race startup. After
+an exit, the scaler gives GitHub up to 30 seconds to deliver the real completion
+message, then stops/removes the environment and deregisters the runner. It never
+invents a job result. A failed stop/remove or deregistration cannot produce a
+successful drain receipt. Failed starts also attempt teardown, since creation may
+have succeeded before startup failed.
+
+Docker logs are limited to two 1 MiB files. Before removal, the last 200 lines
+(up to 64 KiB) are copied to private files under
+`$XDG_CACHE_HOME/outrunner/diagnostics` (32 bounded slots). The systemd package
+provides a writable cache directory. Exit codes and OOM status go to the journal;
+job output remains in those private diagnostic files. Old containers bearing this
+scale set's ownership labels are cleaned up on restart.
+
+The credential-free integration test accepts `OUTRUNNER_EXIT_TEST_IMAGE`, pointing
+to a local image whose `/exit` program exits with code 17. It verifies immediate
+exit detection, retained diagnostics, container removal, and repeated cleanup.

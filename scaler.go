@@ -44,6 +44,7 @@ type Scaler struct {
 	drainedOnce      sync.Once
 	idleSince        time.Time
 	idleTimer        *time.Timer
+	exitGrace        time.Duration
 
 	lifecycleCtx    context.Context
 	lifecycleCancel context.CancelFunc
@@ -69,6 +70,7 @@ func NewScaler(logger *slog.Logger, client ScaleSetClient, scaleSetID, maxRunner
 		lifecycleCtx:     ctx,
 		lifecycleCancel:  cancel,
 		idleSince:        time.Now(),
+		exitGrace:        30 * time.Second,
 	}
 	// NewScaler is called after scale-set registration, including on zero-job hosts.
 	s.mu.Lock()
@@ -344,6 +346,14 @@ func (s *Scaler) runRunnerLifecycle(state *RunnerState, req *RunnerRequest) {
 			slog.String("name", name),
 			slog.String("error", err.Error()),
 		)
+		// Start may have created an environment before failing. Prove teardown
+		// before deregistering or allowing a drain receipt.
+		stopCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if err := s.provisioner.Stop(stopCtx, name); err != nil {
+			s.logger.Error("Failed to clean up partial start", slog.String("name", name), slog.Any("error", err))
+			return
+		}
 		cleaned = s.deregisterRunner(name, state.RunnerID)
 		return
 	}
@@ -359,13 +369,53 @@ func (s *Scaler) runRunnerLifecycle(state *RunnerState, req *RunnerRequest) {
 	state.StartedAt = time.Now()
 	s.mu.Unlock()
 
-	// 2. Wait for completion signal or shutdown
+	// The environment may disappear without any GitHub completion message.
+	// Keep watching separate from the listener so a drained host cannot hold
+	// a dead runner indefinitely. Cancellation joins the watcher before Stop.
+	watchCtx, watchCancel := context.WithCancel(s.lifecycleCtx)
+	var exited <-chan error
+	watchDone := make(chan struct{})
+	if watcher, ok := s.provisioner.(ExitWatcher); ok {
+		result := make(chan error, 1)
+		exited = result
+		go func() {
+			defer close(watchDone)
+			result <- watcher.Wait(watchCtx, name)
+		}()
+	} else {
+		close(watchDone)
+	}
+	// 2. Wait for completion signal, environment exit, or shutdown.
 	select {
+	case err := <-exited:
+		if err != nil && s.lifecycleCtx.Err() == nil {
+			// An API failure is not evidence of container exit. Continue waiting
+			// for the listener; Docker's watcher retries transient failures.
+			s.logger.Error("Runner exit observation failed", slog.String("name", name), slog.Any("error", err))
+			select {
+			case <-state.done:
+			case <-s.lifecycleCtx.Done():
+			}
+		} else if s.lifecycleCtx.Err() == nil {
+			s.logger.Warn("Runner environment exited", slog.String("name", name))
+			// Normal ephemeral exits can arrive before JobCompleted. Give the
+			// listener time to record the real job result; never invent one.
+			timer := time.NewTimer(s.exitGrace)
+			select {
+			case <-state.done:
+			case <-timer.C:
+			case <-s.lifecycleCtx.Done():
+			}
+			timer.Stop()
+		}
 	case <-state.done:
 		s.logger.Debug("Runner signaled done", slog.String("name", name))
 	case <-s.lifecycleCtx.Done():
 		s.logger.Debug("Runner shutdown requested", slog.String("name", name))
 	}
+
+	watchCancel()
+	<-watchDone
 
 	// 3. Stop
 	s.mu.Lock()

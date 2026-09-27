@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -672,10 +673,10 @@ func TestProvisioningFailure(t *testing.T) {
 		t.Errorf("expected 1 RemoveRunner call, got %d", client.removeCount.Load())
 	}
 
-	// Stop should NOT be called (Start failed)
+	// Start can fail after creating the environment; cleanup is required.
 	stopped := prov.stoppedNames()
-	if len(stopped) != 0 {
-		t.Errorf("expected no Stop calls, got %v", stopped)
+	if len(stopped) != 1 {
+		t.Errorf("expected cleanup after failed Start, got %v", stopped)
 	}
 
 	s.Shutdown(context.Background())
@@ -1005,4 +1006,86 @@ func TestRunnerNamePrefix(t *testing.T) {
 	}
 
 	s.Shutdown(context.Background())
+}
+
+type watchedProvisioner struct {
+	*mockProvisioner
+	exit     chan struct{}
+	watching chan struct{}
+}
+
+func (p *watchedProvisioner) Wait(ctx context.Context, _ string) error {
+	close(p.watching)
+	select {
+	case <-p.exit:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestExitedContainerDoesNotStrandDrain(t *testing.T) {
+	for _, stopFails := range []bool{false, true} {
+		t.Run(fmt.Sprint(stopFails), func(t *testing.T) {
+			prov := &watchedProvisioner{newMockProvisioner(), make(chan struct{}), make(chan struct{})}
+			if stopFails {
+				prov.stopErr = errors.New("docker unavailable")
+			}
+			client := newMockClient()
+			s := newTestScaler(client, prov)
+			s.exitGrace = time.Millisecond
+			defer s.Shutdown(context.Background())
+			if _, err := s.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+				t.Fatal(err)
+			}
+			<-prov.watching
+			if err := s.RequestDrain(); err != nil {
+				t.Fatal(err)
+			}
+			close(prov.exit) // no JobStarted or JobCompleted will ever arrive
+			done := make(chan struct{})
+			go func() { s.wg.Wait(); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("dead container stranded drain")
+			}
+			select {
+			case <-s.Drained():
+				if stopFails {
+					t.Fatal("cleanup failure produced drain proof")
+				}
+			default:
+				if !stopFails {
+					t.Fatal("cleaned container did not drain")
+				}
+			}
+			if s.completedJobs != 0 {
+				t.Fatal("invented a completed job")
+			}
+			if !stopFails && client.removeCount.Load() != 1 {
+				t.Fatal("runner was not deregistered")
+			}
+		})
+	}
+}
+
+func TestPartialStartFailureRequiresCleanup(t *testing.T) {
+	prov := newMockProvisioner()
+	prov.startErr = errors.New("container created but start failed")
+	prov.stopErr = errors.New("cannot remove")
+	client := newMockClient()
+	s := newTestScaler(client, prov)
+	defer s.Shutdown(context.Background())
+	_, _ = s.HandleDesiredRunnerCount(context.Background(), 1)
+	s.wg.Wait()
+	if len(prov.stoppedNames()) != 1 {
+		t.Fatal("partial start was not cleaned up")
+	}
+	if client.removeCount.Load() != 0 {
+		t.Fatal("deregistered without cleanup proof")
+	}
+	if err := s.RequestDrain(); err == nil {
+		t.Fatal("unsafe drain succeeded")
+	}
 }

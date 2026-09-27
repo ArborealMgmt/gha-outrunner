@@ -3,15 +3,19 @@ package docker
 import (
 	"context"
 	"fmt"
+	"github.com/docker/docker/errdefs"
 	"io"
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"time"
 
 	outrunner "github.com/NetwindHQ/gha-outrunner"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/client"
@@ -116,7 +120,8 @@ func (d *Provisioner) Start(ctx context.Context, req *outrunner.RunnerRequest) e
 			},
 		},
 		&container.HostConfig{
-			AutoRemove:  true,
+			AutoRemove:  false,
+			LogConfig:   container.LogConfig{Type: "local", Config: map[string]string{"max-size": "1m", "max-file": "2"}},
 			Mounts:      mounts,
 			NetworkMode: networkMode,
 		},
@@ -138,17 +143,95 @@ func (d *Provisioner) Start(ctx context.Context, req *outrunner.RunnerRequest) e
 	return nil
 }
 
+// Wait polls retained container state, including exits that beat Start's return.
+// Inspection failures are retried: inability to observe is not proof of exit.
+func (d *Provisioner) Wait(ctx context.Context, name string) error {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		info, err := d.client.ContainerInspect(ctx, name)
+		if errdefs.IsNotFound(err) {
+			return nil
+		}
+		if err == nil && info.State != nil && !info.State.Running {
+			d.logger.Warn("Container exited", slog.String("name", name),
+				slog.Int("exitCode", info.State.ExitCode), slog.Bool("oomKilled", info.State.OOMKilled))
+			return nil
+		}
+		if err != nil && ctx.Err() == nil {
+			d.logger.Warn("Container inspection failed; retrying", slog.String("name", name), slog.Any("error", err))
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
 func (d *Provisioner) Stop(ctx context.Context, name string) error {
 	d.logger.Debug("Stopping container", slog.String("name", name))
-	err := d.client.ContainerStop(ctx, name, container.StopOptions{})
-	if err != nil {
-		// Container may already be gone (AutoRemove)
-		d.logger.Debug("Container stop returned error (may already be removed)",
-			slog.String("name", name),
-			slog.String("error", err.Error()),
-		)
+	if err := d.client.ContainerStop(ctx, name, container.StopOptions{}); err != nil && !errdefs.IsNotFound(err) && !errdefs.IsNotModified(err) {
+		return fmt.Errorf("stop container: %w", err)
+	}
+	// Retain bounded diagnostics outside the disposable container, with private
+	// permissions. Do not print job output or JIT material into the journal.
+	d.preserveLogs(ctx, name)
+	if err := d.client.ContainerRemove(ctx, name, container.RemoveOptions{RemoveVolumes: true}); err != nil && !errdefs.IsNotFound(err) {
+		return fmt.Errorf("remove container: %w", err)
 	}
 	return nil
+}
+
+func (d *Provisioner) preserveLogs(ctx context.Context, name string) {
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		return
+	}
+	dir := filepath.Join(cache, "outrunner", "diagnostics")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return
+	}
+	// One fixed-size slot per runner name hash bounds disk use across restarts.
+	// Only this process's own runner names enter the path.
+	var slot uint32
+	for _, b := range []byte(name) {
+		slot = slot*31 + uint32(b)
+	}
+	path := filepath.Join(dir, fmt.Sprintf("container-%02d.log", slot%32))
+	reader, err := d.client.ContainerLogs(ctx, name, container.LogsOptions{ShowStdout: true, ShowStderr: true, Tail: "200"})
+	if err != nil {
+		return
+	}
+	defer func() { _ = reader.Close() }()
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	defer func() { _ = file.Close() }()
+	_, _ = fmt.Fprintf(file, "runner=%s\n", name)
+	_, _ = io.Copy(file, io.LimitReader(reader, 64*1024))
+	d.logger.Info("Container diagnostics retained", slog.String("name", name), slog.String("path", path))
+}
+
+// Cleanup removes retained environments from a prior process using both our
+// ownership label and the exact scale-set name prefix.
+func (d *Provisioner) Cleanup(prefix string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	containers, err := d.client.ContainerList(ctx, container.ListOptions{All: true, Filters: filters.NewArgs(filters.Arg("label", "outrunner=true"))})
+	if err != nil {
+		d.logger.Error("Cannot list orphan containers", slog.Any("error", err))
+		return
+	}
+	for _, item := range containers {
+		name := item.Labels["outrunner.name"]
+		if strings.HasPrefix(name, prefix) {
+			if err := d.Stop(ctx, name); err != nil {
+				d.logger.Error("Cannot clean up orphan container", slog.String("name", name), slog.Any("error", err))
+			}
+		}
+	}
 }
 
 func (d *Provisioner) Close() error {
