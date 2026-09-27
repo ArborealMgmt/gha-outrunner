@@ -2,6 +2,7 @@ package outrunner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -41,9 +42,12 @@ type Scaler struct {
 	drainReason      string
 	drainFailed      bool
 	drained          chan struct{}
+	admissionClosed  chan struct{}
 	drainedOnce      sync.Once
 	idleSince        time.Time
 	idleTimer        *time.Timer
+	exitGrace        time.Duration
+	cleanupRetry     time.Duration
 
 	lifecycleCtx    context.Context
 	lifecycleCancel context.CancelFunc
@@ -66,9 +70,12 @@ func NewScaler(logger *slog.Logger, client ScaleSetClient, scaleSetID, maxRunner
 		completedRunners: make(map[string]bool),
 		jobQueueTimes:    make(map[string]time.Time),
 		drained:          make(chan struct{}),
+		admissionClosed:  make(chan struct{}),
 		lifecycleCtx:     ctx,
 		lifecycleCancel:  cancel,
 		idleSince:        time.Now(),
+		exitGrace:        30 * time.Second,
+		cleanupRetry:     time.Second,
 	}
 	// NewScaler is called after scale-set registration, including on zero-job hosts.
 	s.mu.Lock()
@@ -103,6 +110,10 @@ func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 		)
 		if err != nil {
 			return len(s.runners), fmt.Errorf("generate JIT config: %w", err)
+		}
+
+		if jit == nil || jit.Runner == nil || jit.Runner.ID <= 0 || jit.EncodedJITConfig == "" {
+			return len(s.runners), fmt.Errorf("JIT response is missing runner identity or configuration")
 		}
 
 		state := &RunnerState{
@@ -161,6 +172,10 @@ func (s *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 
 	s.mu.Lock()
 	state, exists := s.runners[jobInfo.RunnerName]
+	if !exists && jobInfo.RunnerName != "" {
+		s.logger.Warn("Completion received for untracked runner; receipt accounting may be incomplete",
+			slog.String("runnerName", jobInfo.RunnerName), slog.Int64("workflowRunId", jobInfo.WorkflowRunID))
+	}
 	if exists && !s.completedRunners[jobInfo.RunnerName] {
 		queueTime := receiptQueueTime(
 			jobInfo.QueueTime,
@@ -188,6 +203,7 @@ func (s *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 		s.idleSince = time.Now()
 		if s.runner.MaxJobs > 0 && s.completedJobs >= s.runner.MaxJobs && !s.draining {
 			s.draining = true
+			close(s.admissionClosed)
 			s.drainReason = "max_jobs"
 			s.logger.Info("Maximum job count reached; stopping admission",
 				slog.Int("completedJobs", s.completedJobs),
@@ -230,6 +246,7 @@ func (s *Scaler) RequestDrain() error {
 		return nil
 	}
 	s.draining = true
+	close(s.admissionClosed)
 	s.drainReason = "external"
 	s.logger.Info("External drain requested; stopping admission",
 		slog.Int("trackedRunners", len(s.runners)),
@@ -266,10 +283,16 @@ func (s *Scaler) checkIdleDrain() {
 		return
 	}
 	s.draining = true
+	close(s.admissionClosed)
 	s.drainReason = "idle"
 	s.logger.Info("Idle linger expired; stopping admission")
 	_ = s.finishDrainLocked()
 }
+
+// AdmissionClosed closes as soon as a drain begins. The listener must advertise
+// zero capacity while existing runners finish, rather than acquiring assignments
+// that HandleDesiredRunnerCount will refuse to provision.
+func (s *Scaler) AdmissionClosed() <-chan struct{} { return s.admissionClosed }
 
 // Drained closes after admission stops and every tracked runner has been
 // successfully stopped and deregistered, with any configured receipt durable.
@@ -344,7 +367,8 @@ func (s *Scaler) runRunnerLifecycle(state *RunnerState, req *RunnerRequest) {
 			slog.String("name", name),
 			slog.String("error", err.Error()),
 		)
-		cleaned = s.deregisterRunner(name, state.RunnerID)
+		// Start can fail after creation. Keep ownership until cleanup is proven.
+		cleaned = s.cleanupRunner(state)
 		return
 	}
 
@@ -359,38 +383,89 @@ func (s *Scaler) runRunnerLifecycle(state *RunnerState, req *RunnerRequest) {
 	state.StartedAt = time.Now()
 	s.mu.Unlock()
 
-	// 2. Wait for completion signal or shutdown
+	// The environment may disappear without any GitHub completion message.
+	// Keep watching separate from the listener so a drained host cannot hold
+	// a dead runner indefinitely. Cancellation joins the watcher before Stop.
+	watchCtx, watchCancel := context.WithCancel(s.lifecycleCtx)
+	var exited <-chan error
+	watchDone := make(chan struct{})
+	if watcher, ok := s.provisioner.(ExitWatcher); ok {
+		result := make(chan error, 1)
+		exited = result
+		go func() {
+			defer close(watchDone)
+			result <- watcher.Wait(watchCtx, name)
+		}()
+	} else {
+		close(watchDone)
+	}
+	// 2. Wait for completion signal, environment exit, or shutdown.
 	select {
+	case err := <-exited:
+		if err != nil && s.lifecycleCtx.Err() == nil {
+			// An API failure is not evidence of container exit. Continue waiting
+			// for the listener; Docker's watcher retries transient failures.
+			s.logger.Error("Runner exit observation failed", slog.String("name", name), slog.Any("error", err))
+			select {
+			case <-state.done:
+			case <-s.lifecycleCtx.Done():
+			}
+		} else if s.lifecycleCtx.Err() == nil {
+			s.logger.Warn("Runner environment exited", slog.String("name", name))
+			// Normal ephemeral exits can arrive before JobCompleted. Give the
+			// listener time to record the real job result; never invent one.
+			timer := time.NewTimer(s.exitGrace)
+			select {
+			case <-state.done:
+			case <-timer.C:
+			case <-s.lifecycleCtx.Done():
+			}
+			timer.Stop()
+		}
 	case <-state.done:
 		s.logger.Debug("Runner signaled done", slog.String("name", name))
 	case <-s.lifecycleCtx.Done():
 		s.logger.Debug("Runner shutdown requested", slog.String("name", name))
 	}
 
-	// 3. Stop
+	watchCancel()
+	<-watchDone
+
+	cleaned = s.cleanupRunner(state)
+}
+
+// Keep failed cleanup tracked and retry transient Docker/GitHub failures. Only
+// shutdown can abandon the proof, in which case removeRunner fails the drain.
+func (s *Scaler) cleanupRunner(state *RunnerState) bool {
 	s.mu.Lock()
 	state.Phase = RunnerStopping
 	s.mu.Unlock()
-
-	s.logger.Info("Stopping runner", slog.String("name", name))
-	stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer stopCancel()
-	if err := s.provisioner.Stop(stopCtx, name); err != nil {
-		s.logger.Error("Failed to stop runner",
-			slog.String("name", name),
-			slog.String("error", err.Error()),
-		)
-		return
+	delay := s.cleanupRetry
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		err := s.provisioner.Stop(ctx, state.Name)
+		cancel()
+		if err == nil && s.deregisterRunner(state.Name, state.RunnerID) {
+			return true
+		}
+		s.logger.Warn("Runner cleanup incomplete; retaining ownership for retry",
+			slog.String("name", state.Name), slog.Any("error", err))
+		timer := time.NewTimer(delay)
+		select {
+		case <-s.lifecycleCtx.Done():
+			timer.Stop()
+			return false
+		case <-timer.C:
+		}
+		delay = min(30*time.Second, delay*2)
 	}
-
-	// 4. Deregister from GitHub
-	cleaned = s.deregisterRunner(name, state.RunnerID)
 }
 
 func (s *Scaler) removeRunner(name string, cleaned bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.runners, name)
+	s.idleSince = time.Now()
 	delete(s.completedRunners, name)
 	delete(s.jobQueueTimes, name)
 	if !cleaned {
@@ -444,7 +519,7 @@ func (s *Scaler) deregisterRunner(name string, runnerID int) bool {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := s.client.RemoveRunner(ctx, int64(runnerID)); err != nil {
+	if err := s.client.RemoveRunner(ctx, int64(runnerID)); err != nil && !errors.Is(err, scaleset.RunnerNotFoundError) {
 		s.logger.Warn("Failed to deregister runner",
 			slog.String("name", name),
 			slog.Int("runnerID", runnerID),

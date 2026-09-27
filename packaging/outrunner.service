@@ -25,6 +25,8 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/tmp
+CacheDirectory=outrunner
+Environment=XDG_CACHE_HOME=/var/cache
 # PrivateTmp must be off — the libvirt provisioner creates qcow2 overlays
 # in /tmp that libvirt/QEMU needs to access from outside the namespace.
 PrivateTmp=false

@@ -113,7 +113,7 @@ func writeDrainReceipt(config *DrainReceiptConfig, receipt DrainReceipt) error {
 	if err != nil {
 		return fmt.Errorf("open drain receipt directory: %w", err)
 	}
-	defer dir.Close()
+	defer func() { _ = dir.Close() }()
 	if err := dir.Sync(); err != nil {
 		return fmt.Errorf("sync drain receipt directory: %w", err)
 	}

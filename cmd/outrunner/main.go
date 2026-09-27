@@ -174,7 +174,9 @@ func runWorker(ctx context.Context, externalDrain <-chan struct{}, logger, liste
 	defer func() { _ = prov.Close() }()
 
 	// Clean up orphans from previous runs
-	cleanupOrphans(logger, prov, name)
+	if err := cleanupOrphans(ctx, logger, prov, name); err != nil {
+		return fmt.Errorf("runner %s: recover orphans: %w", name, err)
+	}
 
 	// Build labels
 	var labels []scaleset.Label
@@ -244,12 +246,24 @@ func runWorker(ctx context.Context, externalDrain <-chan struct{}, logger, liste
 	defer listenerCancel()
 	go func() {
 		select {
+		case <-scaler.AdmissionClosed():
+			l.SetMaxRunners(0)
+			logger.Info("Stopped acquiring new assignments while draining")
+		case <-listenerCtx.Done():
+		}
+	}()
+	go func() {
+		select {
 		case <-externalDrain:
 			if err := scaler.RequestDrain(); err != nil {
 				logger.Error("External drain failed", slog.String("error", err.Error()))
 				return
 			}
-			<-scaler.Drained()
+			select {
+			case <-scaler.Drained():
+			case <-listenerCtx.Done():
+				return
+			}
 			logger.Info("Runner scale set drained after external request")
 			listenerCancel()
 		case <-scaler.Drained():
@@ -309,12 +323,29 @@ func labelsMatch(existing []scaleset.Label, desired []scaleset.Label) bool {
 }
 
 // cleanupOrphans removes leftover resources from previous runs.
-func cleanupOrphans(logger *slog.Logger, prov outrunner.Provisioner, name string) {
+func cleanupOrphans(ctx context.Context, logger *slog.Logger, prov outrunner.Provisioner, name string) error {
 	prefix := name + "-"
+	if c, ok := prov.(interface {
+		Cleanup(context.Context, string) error
+	}); ok {
+		for {
+			if err := c.Cleanup(ctx, prefix); err == nil {
+				return nil
+			} else {
+				logger.Warn("Orphan recovery incomplete; admission remains closed", slog.String("scaleSet", name), slog.Any("error", err))
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(5 * time.Second):
+			}
+		}
+	}
 	type cleaner interface {
 		Cleanup(prefix string)
 	}
 	if c, ok := prov.(cleaner); ok {
 		c.Cleanup(prefix)
 	}
+	return nil
 }

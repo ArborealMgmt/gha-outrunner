@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -635,8 +636,8 @@ func TestMaxJobsDoesNotReportDrainedWhenDeregistrationFails(t *testing.T) {
 	}
 	if count, err := s.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
 		t.Fatalf("HandleDesiredRunnerCount while failed-draining: %v", err)
-	} else if count != 0 {
-		t.Fatalf("expected admission to remain closed, got %d runners", count)
+	} else if count != 1 {
+		t.Fatalf("expected failed runner to remain tracked, got %d runners", count)
 	}
 	if _, err := os.Stat(receiptPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("receipt must not exist after deregistration failure: %v", err)
@@ -672,10 +673,10 @@ func TestProvisioningFailure(t *testing.T) {
 		t.Errorf("expected 1 RemoveRunner call, got %d", client.removeCount.Load())
 	}
 
-	// Stop should NOT be called (Start failed)
+	// Start can fail after creating the environment; cleanup is required.
 	stopped := prov.stoppedNames()
-	if len(stopped) != 0 {
-		t.Errorf("expected no Stop calls, got %v", stopped)
+	if len(stopped) != 1 {
+		t.Errorf("expected cleanup after failed Start, got %v", stopped)
 	}
 
 	s.Shutdown(context.Background())
@@ -1005,4 +1006,165 @@ func TestRunnerNamePrefix(t *testing.T) {
 	}
 
 	s.Shutdown(context.Background())
+}
+
+type watchedProvisioner struct {
+	*mockProvisioner
+	exit     chan struct{}
+	watching chan struct{}
+}
+
+func (p *watchedProvisioner) Wait(ctx context.Context, _ string) error {
+	close(p.watching)
+	select {
+	case <-p.exit:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestExitedContainerDoesNotStrandDrain(t *testing.T) {
+	for _, stopFails := range []bool{false, true} {
+		t.Run(fmt.Sprint(stopFails), func(t *testing.T) {
+			prov := &watchedProvisioner{newMockProvisioner(), make(chan struct{}), make(chan struct{})}
+			if stopFails {
+				prov.stopErr = errors.New("docker unavailable")
+			}
+			client := newMockClient()
+			s := newTestScaler(client, prov)
+			s.exitGrace = time.Millisecond
+			defer s.Shutdown(context.Background())
+			if _, err := s.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+				t.Fatal(err)
+			}
+			<-prov.watching
+			if err := s.RequestDrain(); err != nil {
+				t.Fatal(err)
+			}
+			close(prov.exit) // no JobStarted or JobCompleted will ever arrive
+			if stopFails {
+				s.lifecycleCancel()
+			}
+			done := make(chan struct{})
+			go func() { s.wg.Wait(); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("dead container stranded drain")
+			}
+			select {
+			case <-s.Drained():
+				if stopFails {
+					t.Fatal("cleanup failure produced drain proof")
+				}
+			default:
+				if !stopFails {
+					t.Fatal("cleaned container did not drain")
+				}
+			}
+			if s.completedJobs != 0 {
+				t.Fatal("invented a completed job")
+			}
+			if !stopFails && client.removeCount.Load() != 1 {
+				t.Fatal("runner was not deregistered")
+			}
+		})
+	}
+}
+
+func TestPartialStartFailureRequiresCleanup(t *testing.T) {
+	prov := newMockProvisioner()
+	prov.startErr = errors.New("container created but start failed")
+	prov.stopErr = errors.New("cannot remove")
+	client := newMockClient()
+	s := newTestScaler(client, prov)
+	defer s.Shutdown(context.Background())
+	_, _ = s.HandleDesiredRunnerCount(context.Background(), 1)
+	s.lifecycleCancel()
+	s.wg.Wait()
+	if len(prov.stoppedNames()) != 1 {
+		t.Fatal("partial start was not cleaned up")
+	}
+	if client.removeCount.Load() != 0 {
+		t.Fatal("deregistered without cleanup proof")
+	}
+	if err := s.RequestDrain(); err == nil {
+		t.Fatal("unsafe drain succeeded")
+	}
+}
+
+func TestDrainClosesAdmissionBeforeRunnerCleanup(t *testing.T) {
+	for _, reason := range []string{"external", "max_jobs"} {
+		t.Run(reason, func(t *testing.T) {
+			prov := newMockProvisioner()
+			prov.startCh = make(chan struct{})
+			s := newTestScaler(newMockClient(), prov)
+			s.runner.MaxJobs = 1
+			defer s.Shutdown(context.Background())
+			_, _ = s.HandleDesiredRunnerCount(context.Background(), 1)
+			name := s.Runners()[0].Name
+			if reason == "external" {
+				_ = s.RequestDrain()
+			} else {
+				_ = s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: name})
+			}
+			select {
+			case <-s.AdmissionClosed():
+			default:
+				t.Fatal("listener still accepting assignments")
+			}
+			select {
+			case <-s.Drained():
+				t.Fatal("drain completed before teardown")
+			default:
+			}
+			count, err := s.HandleDesiredRunnerCount(context.Background(), 2)
+			if err != nil || count != 1 {
+				t.Fatalf("admitted replacement while draining: %d %v", count, err)
+			}
+		})
+	}
+}
+
+type transientStopProvisioner struct {
+	*mockProvisioner
+	attempts atomic.Int32
+}
+
+func (p *transientStopProvisioner) Stop(ctx context.Context, name string) error {
+	if p.attempts.Add(1) == 1 {
+		return errors.New("temporary Docker failure")
+	}
+	return p.mockProvisioner.Stop(ctx, name)
+}
+func TestTransientCleanupFailureRecoversWithoutLosingDrainProof(t *testing.T) {
+	prov := &transientStopProvisioner{mockProvisioner: newMockProvisioner()}
+	s := newTestScaler(newMockClient(), prov)
+	s.cleanupRetry = time.Millisecond
+	defer s.Shutdown(context.Background())
+	_, _ = s.HandleDesiredRunnerCount(context.Background(), 1)
+	name := s.Runners()[0].Name
+	_ = s.RequestDrain()
+	_ = s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: name})
+	select {
+	case <-s.Drained():
+	case <-time.After(time.Second):
+		t.Fatal("transient cleanup failure wedged drain")
+	}
+	if prov.attempts.Load() != 2 {
+		t.Fatal("cleanup did not retry")
+	}
+}
+
+func TestMissingJITIdentityDoesNotProvisionUnrecoverableRunner(t *testing.T) {
+	client := newMockClient()
+	client.nextID = 0
+	prov := newMockProvisioner()
+	s := newTestScaler(client, prov)
+	defer s.Shutdown(context.Background())
+	count, err := s.HandleDesiredRunnerCount(context.Background(), 1)
+	if err == nil || count != 0 || len(s.Runners()) != 0 || len(prov.started) != 0 {
+		t.Fatalf("admitted runner without cleanup identity: count=%d err=%v", count, err)
+	}
 }
