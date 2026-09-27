@@ -112,6 +112,10 @@ func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 			return len(s.runners), fmt.Errorf("generate JIT config: %w", err)
 		}
 
+		if jit == nil || jit.Runner == nil || jit.Runner.ID <= 0 || jit.EncodedJITConfig == "" {
+			return len(s.runners), fmt.Errorf("JIT response is missing runner identity or configuration")
+		}
+
 		state := &RunnerState{
 			Name:      name,
 			RunnerID:  jit.Runner.ID,
@@ -461,6 +465,7 @@ func (s *Scaler) removeRunner(name string, cleaned bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.runners, name)
+	s.idleSince = time.Now()
 	delete(s.completedRunners, name)
 	delete(s.jobQueueTimes, name)
 	if !cleaned {

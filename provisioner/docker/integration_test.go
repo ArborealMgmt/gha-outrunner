@@ -82,8 +82,18 @@ func TestRestartCleanupPreservesLiveContainer(t *testing.T) {
 	if err := p.Start(ctx, &outrunner.RunnerRequest{Name: name, JITConfig: "hold", Runner: &outrunner.RunnerConfig{Docker: &outrunner.DockerImage{Image: image, RunnerCmd: "/exit"}}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.Cleanup("outrunner-live-"); err == nil {
-		t.Fatal("admission reopened with a live orphan")
+	// The sibling scale set named "outrunner" must not claim this runner.
+	siblingCtx, siblingCancel := context.WithTimeout(ctx, time.Second)
+	defer siblingCancel()
+	if err := p.Cleanup(siblingCtx, "outrunner-"); err != nil {
+		t.Fatalf("sibling scale set claimed a foreign orphan: %v", err)
+	}
+	recovered := make(chan error, 1)
+	go func() { recovered <- p.Cleanup(ctx, "outrunner-live-") }()
+	select {
+	case err := <-recovered:
+		t.Fatalf("recovery returned while orphan is live: %v", err)
+	case <-time.After(50 * time.Millisecond):
 	}
 	info, err := p.client.ContainerInspect(ctx, name)
 	if err != nil || !info.State.Running {
@@ -92,7 +102,12 @@ func TestRestartCleanupPreservesLiveContainer(t *testing.T) {
 	if err := p.Stop(ctx, name); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.Cleanup("outrunner-live-"); err != nil {
-		t.Fatal(err)
+	select {
+	case err := <-recovered:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("recovery did not resume after orphan exit")
 	}
 }

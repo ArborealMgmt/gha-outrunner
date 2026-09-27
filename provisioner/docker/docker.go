@@ -212,8 +212,15 @@ func (d *Provisioner) preserveLogs(ctx context.Context, name string) {
 		return
 	}
 	defer func() { _ = file.Close() }()
-	_, _ = fmt.Fprintf(file, "runner=%s\n", name)
-	_, _ = io.Copy(file, io.LimitReader(reader, 64*1024))
+	_, writeErr := fmt.Fprintf(file, "runner=%s\n", name)
+	if writeErr == nil {
+		_, writeErr = io.Copy(file, io.LimitReader(reader, 64*1024))
+	}
+	closeErr := file.Close()
+	if writeErr != nil || closeErr != nil {
+		d.logger.Warn("Container diagnostics incomplete", slog.String("name", name), slog.Any("writeError", writeErr), slog.Any("closeError", closeErr))
+		return
+	}
 	path := file.Name()
 	// Keep the latest 32 records across all scale sets. Unique files and a
 	// process-wide lock avoid overwriting simultaneous failures by hash collision.
@@ -239,22 +246,23 @@ func (d *Provisioner) preserveLogs(ctx context.Context, name string) {
 
 // Cleanup removes retained environments from a prior process using both our
 // ownership label and the exact scale-set name prefix.
-func (d *Provisioner) Cleanup(prefix string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
+func (d *Provisioner) Cleanup(ctx context.Context, prefix string) error {
 	containers, err := d.client.ContainerList(ctx, container.ListOptions{All: true, Filters: filters.NewArgs(filters.Arg("label", "outrunner=true"))})
 	if err != nil {
 		return fmt.Errorf("list orphan containers: %w", err)
 	}
 	for _, item := range containers {
 		name := item.Labels["outrunner.name"]
-		if !strings.HasPrefix(name, prefix) {
+		if split := strings.LastIndexByte(name, '-'); split < 0 || name[:split+1] != prefix {
 			continue
 		}
 		if item.State != "exited" && item.State != "dead" && item.State != "created" {
 			// A process restart must not abort a job that survived it. Refuse
 			// new admission and drain proof until the old environment exits.
-			return fmt.Errorf("orphan container %s is still %s", name, item.State)
+			d.logger.Warn("Waiting for surviving runner before admission", slog.String("name", name))
+			if err := d.Wait(ctx, name); err != nil {
+				return fmt.Errorf("wait for orphan %s: %w", name, err)
+			}
 		}
 		d.preserveLogs(ctx, name)
 		// Never call Stop or force removal here: the state can change after

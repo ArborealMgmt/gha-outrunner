@@ -1156,3 +1156,15 @@ func TestTransientCleanupFailureRecoversWithoutLosingDrainProof(t *testing.T) {
 		t.Fatal("cleanup did not retry")
 	}
 }
+
+func TestMissingJITIdentityDoesNotProvisionUnrecoverableRunner(t *testing.T) {
+	client := newMockClient()
+	client.nextID = 0
+	prov := newMockProvisioner()
+	s := newTestScaler(client, prov)
+	defer s.Shutdown(context.Background())
+	count, err := s.HandleDesiredRunnerCount(context.Background(), 1)
+	if err == nil || count != 0 || len(s.Runners()) != 0 || len(prov.started) != 0 {
+		t.Fatalf("admitted runner without cleanup identity: count=%d err=%v", count, err)
+	}
+}
