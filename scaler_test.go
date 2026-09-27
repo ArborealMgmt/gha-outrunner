@@ -1089,3 +1089,36 @@ func TestPartialStartFailureRequiresCleanup(t *testing.T) {
 		t.Fatal("unsafe drain succeeded")
 	}
 }
+
+func TestDrainClosesAdmissionBeforeRunnerCleanup(t *testing.T) {
+	for _, reason := range []string{"external", "max_jobs"} {
+		t.Run(reason, func(t *testing.T) {
+			prov := newMockProvisioner()
+			prov.startCh = make(chan struct{})
+			s := newTestScaler(newMockClient(), prov)
+			s.runner.MaxJobs = 1
+			defer s.Shutdown(context.Background())
+			_, _ = s.HandleDesiredRunnerCount(context.Background(), 1)
+			name := s.Runners()[0].Name
+			if reason == "external" {
+				_ = s.RequestDrain()
+			} else {
+				_ = s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: name})
+			}
+			select {
+			case <-s.AdmissionClosed():
+			default:
+				t.Fatal("listener still accepting assignments")
+			}
+			select {
+			case <-s.Drained():
+				t.Fatal("drain completed before teardown")
+			default:
+			}
+			count, err := s.HandleDesiredRunnerCount(context.Background(), 2)
+			if err != nil || count != 1 {
+				t.Fatalf("admitted replacement while draining: %d %v", count, err)
+			}
+		})
+	}
+}

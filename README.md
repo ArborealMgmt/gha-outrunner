@@ -75,6 +75,8 @@ Built by [Paweł Subocz](https://x.com/psubocz) at [Netwind](https://netwind.pl)
 
 ### Docker exit recovery
 
+A draining listener advertises zero capacity immediately while existing runners
+finish, so it cannot acquire assignments that the scaler will refuse to launch.
 Docker environments are retained until the scaler cleans them up. An exit watcher
 inspects their state every two seconds, including exits that race startup. After
 an exit, the scaler gives GitHub up to 30 seconds to deliver the real completion

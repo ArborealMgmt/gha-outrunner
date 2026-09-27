@@ -244,12 +244,24 @@ func runWorker(ctx context.Context, externalDrain <-chan struct{}, logger, liste
 	defer listenerCancel()
 	go func() {
 		select {
+		case <-scaler.AdmissionClosed():
+			l.SetMaxRunners(0)
+			logger.Info("Stopped acquiring new assignments while draining")
+		case <-listenerCtx.Done():
+		}
+	}()
+	go func() {
+		select {
 		case <-externalDrain:
 			if err := scaler.RequestDrain(); err != nil {
 				logger.Error("External drain failed", slog.String("error", err.Error()))
 				return
 			}
-			<-scaler.Drained()
+			select {
+			case <-scaler.Drained():
+			case <-listenerCtx.Done():
+				return
+			}
 			logger.Info("Runner scale set drained after external request")
 			listenerCancel()
 		case <-scaler.Drained():

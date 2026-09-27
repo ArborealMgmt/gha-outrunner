@@ -41,6 +41,7 @@ type Scaler struct {
 	drainReason      string
 	drainFailed      bool
 	drained          chan struct{}
+	admissionClosed  chan struct{}
 	drainedOnce      sync.Once
 	idleSince        time.Time
 	idleTimer        *time.Timer
@@ -67,6 +68,7 @@ func NewScaler(logger *slog.Logger, client ScaleSetClient, scaleSetID, maxRunner
 		completedRunners: make(map[string]bool),
 		jobQueueTimes:    make(map[string]time.Time),
 		drained:          make(chan struct{}),
+		admissionClosed:  make(chan struct{}),
 		lifecycleCtx:     ctx,
 		lifecycleCancel:  cancel,
 		idleSince:        time.Now(),
@@ -190,6 +192,7 @@ func (s *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 		s.idleSince = time.Now()
 		if s.runner.MaxJobs > 0 && s.completedJobs >= s.runner.MaxJobs && !s.draining {
 			s.draining = true
+			close(s.admissionClosed)
 			s.drainReason = "max_jobs"
 			s.logger.Info("Maximum job count reached; stopping admission",
 				slog.Int("completedJobs", s.completedJobs),
@@ -232,6 +235,7 @@ func (s *Scaler) RequestDrain() error {
 		return nil
 	}
 	s.draining = true
+	close(s.admissionClosed)
 	s.drainReason = "external"
 	s.logger.Info("External drain requested; stopping admission",
 		slog.Int("trackedRunners", len(s.runners)),
@@ -268,10 +272,16 @@ func (s *Scaler) checkIdleDrain() {
 		return
 	}
 	s.draining = true
+	close(s.admissionClosed)
 	s.drainReason = "idle"
 	s.logger.Info("Idle linger expired; stopping admission")
 	_ = s.finishDrainLocked()
 }
+
+// AdmissionClosed closes as soon as a drain begins. The listener must advertise
+// zero capacity while existing runners finish, rather than acquiring assignments
+// that HandleDesiredRunnerCount will refuse to provision.
+func (s *Scaler) AdmissionClosed() <-chan struct{} { return s.admissionClosed }
 
 // Drained closes after admission stops and every tracked runner has been
 // successfully stopped and deregistered, with any configured receipt durable.
