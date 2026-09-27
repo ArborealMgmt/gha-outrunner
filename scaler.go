@@ -32,22 +32,25 @@ type Scaler struct {
 	runner      *RunnerConfig
 	provisioner Provisioner
 
-	mu               sync.Mutex
-	runners          map[string]*RunnerState
-	completedRunners map[string]bool
-	jobQueueTimes    map[string]time.Time
-	completedJobInfo []DrainJob
-	completedJobs    int
-	draining         bool
-	drainReason      string
-	drainFailed      bool
-	drained          chan struct{}
-	admissionClosed  chan struct{}
-	drainedOnce      sync.Once
-	idleSince        time.Time
-	idleTimer        *time.Timer
-	exitGrace        time.Duration
-	cleanupRetry     time.Duration
+	mu                    sync.Mutex
+	runners               map[string]*RunnerState
+	completedRunners      map[string]bool
+	jobQueueTimes         map[string]time.Time
+	completedJobInfo      []DrainJob
+	completedJobs         int
+	draining              bool
+	drainReason           string
+	drainFailed           bool
+	drained               chan struct{}
+	admissionClosed       chan struct{}
+	drainedOnce           sync.Once
+	idleSince             time.Time
+	idleTimer             *time.Timer
+	exitGrace             time.Duration
+	cleanupRetry          time.Duration
+	synchronizeAdmission  bool
+	admissionSynchronized bool
+	assignedJobs          int
 
 	lifecycleCtx    context.Context
 	lifecycleCancel context.CancelFunc
@@ -56,7 +59,16 @@ type Scaler struct {
 
 var _ listener.Scaler = (*Scaler)(nil)
 
-func NewScaler(logger *slog.Logger, client ScaleSetClient, scaleSetID, maxRunners int, namePrefix string, runner *RunnerConfig, prov Provisioner) *Scaler {
+// ScalerOption configures coordination with the message listener.
+type ScalerOption func(*Scaler)
+
+// WithAdmissionSynchronization requires a processed zero-capacity poll and no
+// outstanding GitHub assignments before publishing a drain receipt.
+func WithAdmissionSynchronization() ScalerOption {
+	return func(s *Scaler) { s.synchronizeAdmission = true }
+}
+
+func NewScaler(logger *slog.Logger, client ScaleSetClient, scaleSetID, maxRunners int, namePrefix string, runner *RunnerConfig, prov Provisioner, options ...ScalerOption) *Scaler {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Scaler{
 		logger:           logger,
@@ -77,6 +89,9 @@ func NewScaler(logger *slog.Logger, client ScaleSetClient, scaleSetID, maxRunner
 		exitGrace:        30 * time.Second,
 		cleanupRetry:     time.Second,
 	}
+	for _, option := range options {
+		option(s)
+	}
 	// NewScaler is called after scale-set registration, including on zero-job hosts.
 	s.mu.Lock()
 	s.armIdleTimerLocked()
@@ -88,7 +103,8 @@ func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.draining {
+	s.assignedJobs = count
+	if s.draining && !s.synchronizeAdmission {
 		return len(s.runners), nil
 	}
 
@@ -233,11 +249,8 @@ func receiptQueueTime(completed, started, assigned time.Time) time.Time {
 	return assigned
 }
 
-// RequestDrain atomically closes admission. Runners already tracked are
-// allowed to finish normally; the drain receipt is published only after all
-// of them have been stopped and deregistered. If the scale set is idle, the
-// receipt is published immediately while the same mutex that admits runners
-// is held, so a desired-count message cannot race the zero-job proof.
+// RequestDrain stops new admission. With listener synchronization enabled,
+// assignments already accepted by GitHub are honored before terminal proof.
 func (s *Scaler) RequestDrain() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -289,9 +302,8 @@ func (s *Scaler) checkIdleDrain() {
 	_ = s.finishDrainLocked()
 }
 
-// AdmissionClosed closes as soon as a drain begins. The listener must advertise
-// zero capacity while existing runners finish, rather than acquiring assignments
-// that HandleDesiredRunnerCount will refuse to provision.
+// AdmissionClosed instructs the listener to advertise zero capacity. It does
+// not mean an in-flight positive-capacity poll has finished yet.
 func (s *Scaler) AdmissionClosed() <-chan struct{} { return s.admissionClosed }
 
 // Drained closes after admission stops and every tracked runner has been
@@ -479,15 +491,23 @@ func (s *Scaler) removeRunner(name string, cleaned bool) {
 
 // finishDrainLocked publishes the terminal proof while s.mu is held.
 func (s *Scaler) finishDrainLocked() error {
+	if s.synchronizeAdmission && (!s.admissionSynchronized || s.assignedJobs != 0 || len(s.runners) != 0) {
+		return nil
+	}
+
 	if s.drainFailed {
 		return fmt.Errorf("drain cannot prove successful cleanup")
 	}
 	if s.runner.DrainReceipt != nil {
 		version := drainReceiptVersionMaxJobs
 		reason := ""
+		if s.synchronizeAdmission {
+			version = 4
+			reason = s.drainReason
+		}
 		if s.drainReason == "external" || s.drainReason == "idle" {
 			reason = s.drainReason
-			if s.completedJobs == 0 {
+			if s.completedJobs == 0 && !s.synchronizeAdmission {
 				version = drainReceiptVersionExternal
 			}
 		}

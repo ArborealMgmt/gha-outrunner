@@ -227,31 +227,22 @@ func runWorker(ctx context.Context, externalDrain <-chan struct{}, logger, liste
 	}
 	defer func() { _ = sessionClient.Close(context.Background()) }()
 
-	// Create listener
-	l, err := listener.New(sessionClient, listener.Config{
-		ScaleSetID: scaleSet.ID,
-		MaxRunners: maxRunners,
-		Logger:     listenerLogger.WithGroup("listener"),
+	// Create the scaler before the listener so drain completion is fenced by
+	// the actual message exchange, not just a local capacity setting.
+	scaler := outrunner.NewScaler(
+		logger.WithGroup("scaler"), client, scaleSet.ID, maxRunners, name, runner, prov,
+		outrunner.WithAdmissionSynchronization(),
+	)
+	drainSession := outrunner.NewDrainSession(sessionClient, scaler)
+	l, err := listener.New(drainSession, listener.Config{
+		ScaleSetID: scaleSet.ID, MaxRunners: maxRunners,
+		Logger: listenerLogger.WithGroup("listener"),
 	})
 	if err != nil {
 		return fmt.Errorf("runner %s: create listener: %w", name, err)
 	}
-
-	// Create scaler
-	scaler := outrunner.NewScaler(
-		logger.WithGroup("scaler"),
-		client, scaleSet.ID, maxRunners, name, runner, prov,
-	)
 	listenerCtx, listenerCancel := context.WithCancel(ctx)
 	defer listenerCancel()
-	go func() {
-		select {
-		case <-scaler.AdmissionClosed():
-			l.SetMaxRunners(0)
-			logger.Info("Stopped acquiring new assignments while draining")
-		case <-listenerCtx.Done():
-		}
-	}()
 	go func() {
 		select {
 		case <-externalDrain:
@@ -278,7 +269,7 @@ func runWorker(ctx context.Context, externalDrain <-chan struct{}, logger, liste
 		slog.Int("maxRunners", maxRunners),
 		slog.Int("maxJobs", runner.MaxJobs),
 	)
-	err = l.Run(listenerCtx, scaler)
+	err = l.Run(listenerCtx, drainSession)
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
