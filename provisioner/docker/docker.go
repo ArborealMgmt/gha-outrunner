@@ -113,6 +113,12 @@ func (d *Provisioner) Start(ctx context.Context, req *outrunner.RunnerRequest) e
 	if dcfg.HostNetwork {
 		networkMode = container.NetworkMode("host")
 	}
+	var tmpfs map[string]string
+	if os.Getenv("OUTRUNNER_DOCKER_EXEC_SHM") == "1" {
+		// Some CI suites execute temporary helpers from /dev/shm. Docker's
+		// default mount is noexec; keep this opt-in for isolated runner hosts.
+		tmpfs = map[string]string{"/dev/shm": "rw,exec,nosuid,nodev,size=1g"}
+	}
 
 	resp, err := d.client.ContainerCreate(ctx,
 		&container.Config{
@@ -128,6 +134,7 @@ func (d *Provisioner) Start(ctx context.Context, req *outrunner.RunnerRequest) e
 			LogConfig:   container.LogConfig{Type: "json-file", Config: map[string]string{"max-size": "1m", "max-file": "2"}},
 			Mounts:      mounts,
 			NetworkMode: networkMode,
+			Tmpfs:       tmpfs,
 		},
 		nil, nil, req.Name,
 	)

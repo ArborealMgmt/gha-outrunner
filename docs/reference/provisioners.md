@@ -51,6 +51,14 @@ docker:
   host_network: true
 ```
 
+### Executable shared memory
+
+Set `OUTRUNNER_DOCKER_EXEC_SHM=1` on the Outrunner service when job processes
+need to execute temporary files from `/dev/shm`. This replaces Docker's
+per-container `noexec` shared-memory mount with an executable 1 GiB tmpfs.
+It applies only to the runner container, not to containers started by a job.
+Without this setting, Docker's default mount is unchanged.
+
 ### Requirements
 
 - Docker Engine or compatible runtime
