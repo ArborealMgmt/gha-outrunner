@@ -60,6 +60,7 @@ type Scaler struct {
 	// arrives for one after its exit grace is still counted, until the receipt
 	// is written (receiptWritten).
 	unserved       map[string]bool
+	unservedOrder  []string
 	receiptWritten bool
 
 	lifecycleCtx    context.Context
@@ -229,6 +230,12 @@ func (s *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 		s.logger.Warn("Recorded a completion that arrived after its runner was removed",
 			slog.String("runnerName", jobInfo.RunnerName), slog.Int64("workflowRunId", jobInfo.WorkflowRunID))
 		s.recordCompletionLocked(jobInfo)
+		// No runner removal follows this completion, so if it closed admission
+		// on an empty host, publish the drain proof here (synchronized mode
+		// still waits for this message's statistics).
+		if s.draining && !s.drainFailed && len(s.runners) == 0 {
+			_ = s.finishDrainLocked()
+		}
 	case !exists && jobInfo.RunnerName != "":
 		s.logger.Warn("Completion received for untracked runner; receipt accounting may be incomplete",
 			slog.String("runnerName", jobInfo.RunnerName), slog.Int64("workflowRunId", jobInfo.WorkflowRunID))
@@ -240,6 +247,23 @@ func (s *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 	}
 
 	return nil
+}
+
+// unservedLimit bounds how many removed runners are remembered for late
+// completions. The oldest go first: a late completion follows its runner's
+// removal by at most a few listener messages.
+const unservedLimit = 64
+
+// rememberUnservedLocked records a runner removed without a recorded job, so
+// a completion that outlasted its exit grace is still counted. Callers hold
+// s.mu.
+func (s *Scaler) rememberUnservedLocked(name string) {
+	for len(s.unservedOrder) >= unservedLimit {
+		delete(s.unserved, s.unservedOrder[0])
+		s.unservedOrder = s.unservedOrder[1:]
+	}
+	s.unserved[name] = true
+	s.unservedOrder = append(s.unservedOrder, name)
 }
 
 // recordCompletionLocked adds a finished job to the drain receipt and the
@@ -536,15 +560,16 @@ func (s *Scaler) removeRunner(name string, cleaned bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	servedJob := s.completedRunners[name]
-	reaped := false
+	reaped, couldHaveServed := false, false
 	if state, ok := s.runners[name]; ok {
 		reaped = state.reaped
+		// Only a runner that came up and was not proven idle by GitHub can
+		// report a job after it is gone.
+		couldHaveServed = !state.StartedAt.IsZero() && !state.deregistered
 	}
 	delete(s.runners, name)
-	// A runner GitHub agreed to remove never reports a job, so keeping reaped
-	// ones here is harmless; a not-found reap may still have served one.
-	if !servedJob && len(s.unserved) < 64 {
-		s.unserved[name] = true
+	if !servedJob && couldHaveServed {
+		s.rememberUnservedLocked(name)
 	}
 	// Only finished work restarts the idle clock. A spare that failed to start
 	// or exited without a job must not keep a broken host from retiring.
@@ -584,11 +609,12 @@ func (s *Scaler) targetLocked(count int) int {
 }
 
 // liveRunnersLocked counts runners that can still serve an assignment: not
-// finished with a job and not being reaped. Callers hold s.mu.
+// finished with a job and not stopping (dead, failed to start, or reaped).
+// Callers hold s.mu.
 func (s *Scaler) liveRunnersLocked() int {
 	live := 0
 	for _, state := range s.runners {
-		if !s.completedRunners[state.Name] && !state.reaping {
+		if !s.completedRunners[state.Name] && state.Phase != RunnerStopping {
 			live++
 		}
 	}
@@ -724,6 +750,7 @@ func (s *Scaler) reapRunner(state *RunnerState) {
 		// lifecycle goroutine stops the container; its own deregistration
 		// then finds the runner gone, which counts as success.
 		state.reaped = true
+		state.deregistered = true
 		state.Phase = RunnerStopping
 		state.SignalDone()
 	case errors.Is(err, scaleset.RunnerNotFoundError) && watched:

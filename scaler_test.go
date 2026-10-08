@@ -2431,3 +2431,173 @@ func TestLateCompletionAfterExitGraceIsRecorded(t *testing.T) {
 		t.Fatalf("completion counted twice or after the receipt: %d", completed)
 	}
 }
+
+// serveThenOutliveGrace runs one job on a fresh runner whose container exits
+// and whose exit grace passes before any completion arrives.
+func serveThenOutliveGrace(t *testing.T, s *Scaler, prov exitingProvisioner, assigned int) string {
+	t.Helper()
+	s.mu.Lock()
+	s.exitGrace = 10 * time.Millisecond
+	s.mu.Unlock()
+	if _, err := s.HandleDesiredRunnerCount(context.Background(), assigned); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	waitForIdle(t, s, 1)
+	name := s.Runners()[0].Name
+	if err := s.HandleJobStarted(context.Background(), &scaleset.JobStarted{RunnerName: name}); err != nil {
+		t.Fatalf("HandleJobStarted: %v", err)
+	}
+	close(prov.exit)
+	waitForRunnerCount(t, s, 0)
+	return name
+}
+
+func TestLateCompletionFinishesDrainWithoutSynchronization(t *testing.T) {
+	client := newMockClient()
+	prov := exitingProvisioner{newMockProvisioner(), make(chan struct{})}
+	s := NewScaler(noopLogger(), client, 1, 1, "test",
+		&RunnerConfig{MaxJobs: 1, Docker: &DockerImage{Image: "test:latest"}}, prov)
+	defer s.Shutdown(context.Background())
+
+	name := serveThenOutliveGrace(t, s, prov, 1)
+	// The late completion reaches max_jobs on a host with no runner left.
+	if err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: name, Result: "succeeded"}); err != nil {
+		t.Fatalf("HandleJobCompleted: %v", err)
+	}
+	select {
+	case <-s.Drained():
+	case <-time.After(2 * time.Second):
+		t.Fatal("max_jobs reached by a late completion never drained")
+	}
+}
+
+func TestLateCompletionAfterReceiptIsNotCounted(t *testing.T) {
+	client := newMockClient()
+	prov := exitingProvisioner{newMockProvisioner(), make(chan struct{})}
+	s := NewScaler(noopLogger(), client, 1, 1, "test",
+		&RunnerConfig{MaxJobs: 5, Docker: &DockerImage{Image: "test:latest"}}, prov)
+	defer s.Shutdown(context.Background())
+
+	name := serveThenOutliveGrace(t, s, prov, 1)
+	// The receipt is written while the runner's completion is still in flight.
+	if err := s.RequestDrain(); err != nil {
+		t.Fatalf("RequestDrain: %v", err)
+	}
+	select {
+	case <-s.Drained():
+	case <-time.After(2 * time.Second):
+		t.Fatal("external drain did not write its receipt")
+	}
+	if err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: name, Result: "succeeded"}); err != nil {
+		t.Fatalf("HandleJobCompleted: %v", err)
+	}
+	s.mu.Lock()
+	completed, jobs := s.completedJobs, len(s.completedJobInfo)
+	s.mu.Unlock()
+	if completed != 0 || jobs != 0 {
+		t.Fatalf("a completion after the receipt changed it: completed=%d jobs=%d", completed, jobs)
+	}
+}
+
+func TestStoppingRunnerDoesNotHideAnAssignmentJITFailure(t *testing.T) {
+	client := newMockClient()
+	client.jitFailFrom.Store(2)
+	prov := exitingProvisioner{newMockProvisioner(), make(chan struct{})}
+	s := NewScaler(noopLogger(), client, 1, 2, "test",
+		&RunnerConfig{IdleRunners: 1, Docker: &DockerImage{Image: "test:latest"}}, prov)
+	defer s.Shutdown(context.Background())
+	s.mu.Lock()
+	s.exitGrace = 10 * time.Millisecond
+	s.mu.Unlock()
+
+	if _, err := s.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	waitForIdle(t, s, 1)
+	// The spare dies without a job; hold its cleanup so it stays tracked.
+	gate := make(chan struct{})
+	defer close(gate)
+	prov.mu.Lock()
+	prov.stopCh = gate
+	prov.mu.Unlock()
+	close(prov.exit)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if r := s.Runners(); len(r) == 1 && r[0].Phase == RunnerStopping {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("spare never reached stopping; runners %v", s.Runners())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// An assignment arrives; the dying spare cannot serve it.
+	if _, err := s.HandleDesiredRunnerCount(context.Background(), 1); err == nil {
+		t.Fatal("an assignment's JIT failure was swallowed beside a stopping runner")
+	}
+}
+
+func TestUnservedMemoryKeepsTheNewestAndSkipsProvenIdle(t *testing.T) {
+	client := newMockClient()
+	prov := exitingProvisioner{newMockProvisioner(), make(chan struct{})}
+	s := NewScaler(noopLogger(), client, 1, 1, "test",
+		&RunnerConfig{MaxJobs: 5, Docker: &DockerImage{Image: "test:latest"}}, prov)
+	defer s.Shutdown(context.Background())
+
+	s.mu.Lock()
+	for i := range unservedLimit {
+		s.rememberUnservedLocked(fmt.Sprintf("old-%d", i))
+	}
+	s.mu.Unlock()
+	name := serveThenOutliveGrace(t, s, prov, 1)
+	s.mu.Lock()
+	remembered, oldest, size := s.unserved[name], s.unserved["old-0"], len(s.unserved)
+	s.mu.Unlock()
+	if !remembered || oldest || size != unservedLimit {
+		t.Fatalf("expected the newest kept and the oldest evicted: newest=%v oldest=%v size=%d", remembered, oldest, size)
+	}
+
+	// A runner GitHub agreed to remove while idle is never remembered.
+	s.mu.Lock()
+	state := &RunnerState{Name: "proven-idle", StartedAt: time.Now(), deregistered: true, done: make(chan struct{})}
+	s.runners[state.Name] = state
+	s.wg.Add(1)
+	s.mu.Unlock()
+	func() {
+		defer s.wg.Done()
+		s.removeRunner(state.Name, true)
+	}()
+	s.mu.Lock()
+	proven := s.unserved["proven-idle"]
+	s.mu.Unlock()
+	if proven {
+		t.Fatal("remembered a runner GitHub proved idle")
+	}
+}
+
+func TestFailedStartIsNotRememberedForLateCompletions(t *testing.T) {
+	client := newMockClient()
+	prov := newMockProvisioner()
+	prov.startErr = errors.New("docker unavailable")
+	s := NewScaler(noopLogger(), client, 1, 1, "test",
+		&RunnerConfig{Docker: &DockerImage{Image: "test:latest"}}, prov)
+	defer s.Shutdown(context.Background())
+
+	if _, err := s.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for client.removeCount.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("failed runner was never cleaned up")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	waitForRunnerCount(t, s, 0)
+	s.mu.Lock()
+	size := len(s.unserved)
+	s.mu.Unlock()
+	if size != 0 {
+		t.Fatalf("remembered %d runners that never started", size)
+	}
+}

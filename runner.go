@@ -45,6 +45,9 @@ type RunnerState struct {
 	// mutex.
 	reaping bool
 	reaped  bool
+	// deregistered is set when GitHub accepted this runner's removal while it
+	// was idle, which proves it never took a job. Callers hold the mutex.
+	deregistered bool
 
 	done     chan struct{}
 	doneOnce sync.Once
