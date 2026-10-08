@@ -112,6 +112,9 @@ func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 	s.servedSinceStatistics = 0
 	current, err := s.reconcileLocked(ctx, count)
 	s.reapIdleLocked()
+	// An assignment that went away can leave only spares: restart the linger
+	// that an earlier expiry skipped while they covered it.
+	s.armIdleTimerLocked()
 	return current, err
 }
 
@@ -139,6 +142,12 @@ func (s *Scaler) reconcileLocked(ctx context.Context, count int) (int, error) {
 			s.scaleSetID,
 		)
 		if err != nil {
+			if len(s.runners) >= min(s.maxRunners, count) {
+				// Every assignment has a runner; only a spare failed. Retry on
+				// the next message rather than ending the listener.
+				s.logger.Warn("Spare runner JIT request failed", slog.String("error", err.Error()))
+				return len(s.runners), nil
+			}
 			return len(s.runners), fmt.Errorf("generate JIT config: %w", err)
 		}
 
@@ -512,7 +521,11 @@ func (s *Scaler) removeRunner(name string, cleaned bool) {
 		reaped = state.reaped
 	}
 	delete(s.runners, name)
-	s.idleSince = time.Now()
+	// Only finished work restarts the idle clock. A spare that failed to start
+	// or exited without a job must not keep a broken host from retiring.
+	if servedJob {
+		s.idleSince = time.Now()
+	}
 	delete(s.completedRunners, name)
 	delete(s.jobQueueTimes, name)
 	if !cleaned {
@@ -685,6 +698,8 @@ func (s *Scaler) reapRunner(state *RunnerState) {
 		// its messages arrived. Its container exits on its own either way;
 		// the exit watcher and the job's messages record what happened.
 		s.logger.Info("Idle runner already deregistered; waiting for its exit", slog.String("name", state.Name))
+		// Refill when it goes, so an assignment it was covering is served.
+		state.reaped = true
 	case errors.Is(err, scaleset.RunnerNotFoundError):
 		state.reaped = true
 		state.Phase = RunnerStopping

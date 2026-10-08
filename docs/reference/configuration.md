@@ -123,7 +123,8 @@ jobs:
 **Optional.** Number of idle runners kept registered while admission is open, so the next job
 starts on a runner that is already online instead of waiting for a container to start and
 register. The default `0` spawns runners only for assigned jobs. Spares count toward
-`max_runners`, and never exceed what `max_jobs` can still use, so a host's last job does
+`max_runners` (when `max_runners` comes from the `--max-runners` flag, a larger value is
+capped to it), and never exceed what `max_jobs` can still use, so a host's last job does
 not leave a spare behind. When admission closes (`max_jobs`, SIGUSR1 or idle linger), spares
 are not replaced, and an idle runner no assignment needs is deregistered first and stopped
 only once GitHub confirms it has not taken a job.
@@ -141,8 +142,10 @@ message cannot create replacement work on the draining host.
 The idle clock starts after scale-set registration, so a host with no jobs also retires.
 Each completed job restarts the clock. Provisioning, idle JIT runners, running jobs, and
 cleanup all prevent idle drain; admission closes atomically under the scaler mutex only
-when no runner remains. With `idle_runners`, spare runners that no assignment needs do not
-count: the host still retires after the linger, and its spares are deregistered as it drains. Failed cleanup prevents a successful receipt.
+when no runner remains. With `idle_runners` set, only runners a job or assignment needs
+prevent it: spares do not, the host still retires after the linger, and its spares are
+deregistered as it drains. A spare that fails to start or exits without a job does not
+restart the clock. Failed cleanup prevents a successful receipt.
 
 On expiry, Outrunner writes the configured drain receipt with `reason: "idle"` (version 2
 for zero jobs, version 3 otherwise) and exits successfully. The existing systemd
