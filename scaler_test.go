@@ -25,6 +25,7 @@ type mockClient struct {
 	jitErr      error         // if set, GenerateJitRunnerConfig returns this error
 	jitBlock    chan struct{} // if set, JIT calls after the first block until closed or ctx ends
 	jitCalls    atomic.Int32
+	jitFailFrom atomic.Int32 // if set, the Nth JIT call and later fail
 	removeErr   error
 	removeFn    func(runnerID int64) error // if set, overrides removeErr per call
 }
@@ -41,15 +42,22 @@ func newMockClient() *mockClient {
 }
 
 func (m *mockClient) GenerateJitRunnerConfig(ctx context.Context, setting *scaleset.RunnerScaleSetJitRunnerSetting, _ int) (*scaleset.RunnerScaleSetJitRunnerConfig, error) {
-	if m.jitCalls.Add(1) > 1 && m.jitBlock != nil {
+	call := m.jitCalls.Add(1)
+	if failFrom := m.jitFailFrom.Load(); failFrom > 0 && call >= failFrom {
+		return nil, errors.New("GitHub unavailable")
+	}
+	if call > 1 && m.jitBlock != nil {
 		select {
 		case <-m.jitBlock:
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
 	}
-	if m.jitErr != nil {
-		return nil, m.jitErr
+	m.mu.Lock()
+	jitErr := m.jitErr
+	m.mu.Unlock()
+	if jitErr != nil {
+		return nil, jitErr
 	}
 
 	m.mu.Lock()
@@ -2255,5 +2263,171 @@ func TestIdleRunnersSpareJITFailureIsNotFatal(t *testing.T) {
 	// An assignment without a runner is still an error the listener sees.
 	if _, err := s.HandleDesiredRunnerCount(context.Background(), 1); err == nil {
 		t.Fatal("expected an error when an assigned job cannot get a runner")
+	}
+}
+
+// exitingProvisioner is a mockProvisioner whose containers exit only when
+// exit is closed, as an ephemeral runner does after deregistration or a job.
+type exitingProvisioner struct {
+	*mockProvisioner
+	exit chan struct{}
+}
+
+func (e exitingProvisioner) Wait(ctx context.Context, _ string) error {
+	select {
+	case <-e.exit:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestOrphanedIdleRunnerRetiresWithoutIdleRunners(t *testing.T) {
+	client := newMockClient()
+	s := NewScaler(noopLogger(), client, 1, 1, "test",
+		&RunnerConfig{IdleDrainAfter: 150 * time.Millisecond, Docker: &DockerImage{Image: "test:latest"}},
+		newMockProvisioner())
+	defer s.Shutdown(context.Background())
+
+	// A runner is spawned for an assignment that GitHub then cancels.
+	if _, err := s.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	waitForIdle(t, s, 1)
+	time.Sleep(300 * time.Millisecond)
+	if _, err := s.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	select {
+	case <-s.Drained():
+	case <-time.After(2 * time.Second):
+		t.Fatalf("an orphaned idle runner pinned the host; runners %v", s.Runners())
+	}
+}
+
+func TestAssignmentJITFailureIsFatalBesideAFinishedRunner(t *testing.T) {
+	client := newMockClient()
+	client.jitFailFrom.Store(2) // the first runner registers; every later one fails
+	prov := newMockProvisioner()
+	s := NewScaler(noopLogger(), client, 1, 2, "test",
+		&RunnerConfig{IdleRunners: 1, Docker: &DockerImage{Image: "test:latest"}}, prov)
+	defer s.Shutdown(context.Background())
+
+	// One assignment: its runner registers, the spare's JIT fails quietly.
+	if _, err := s.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("a spare's JIT failure must not end the listener: %v", err)
+	}
+	waitForIdle(t, s, 1)
+	name := s.Runners()[0].Name
+	if err := s.HandleJobStarted(context.Background(), &scaleset.JobStarted{RunnerName: name}); err != nil {
+		t.Fatalf("HandleJobStarted: %v", err)
+	}
+	// Hold cleanup so the finished runner stays tracked.
+	gate := make(chan struct{})
+	defer close(gate)
+	prov.mu.Lock()
+	prov.stopCh = gate
+	prov.mu.Unlock()
+	if err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: name, Result: "succeeded"}); err != nil {
+		t.Fatalf("HandleJobCompleted: %v", err)
+	}
+	// A new assignment arrives: the finished runner cannot serve it, so its
+	// JIT failure must reach the listener rather than pass as a spare's.
+	if _, err := s.HandleDesiredRunnerCount(context.Background(), 1); err == nil {
+		t.Fatal("an assignment's JIT failure was swallowed as a spare's")
+	}
+}
+
+func TestReapNotFoundWithWatcherRefillsWhenItExits(t *testing.T) {
+	client := newMockClient()
+	var spareID atomic.Int64
+	client.removeFn = func(id int64) error {
+		if id == spareID.Load() {
+			return fmt.Errorf("remove: %w", scaleset.RunnerNotFoundError)
+		}
+		return nil
+	}
+	prov := exitingProvisioner{newMockProvisioner(), make(chan struct{})}
+	s, session, busy, spare := newDrainingPair(t, client, prov)
+	defer s.Shutdown(context.Background())
+	s.mu.Lock()
+	s.exitGrace = 10 * time.Millisecond
+	s.mu.Unlock()
+	spareID.Store(int64(spare.RunnerID))
+
+	if err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: busy.Name, Result: "succeeded"}); err != nil {
+		t.Fatalf("HandleJobCompleted: %v", err)
+	}
+	session.zeroCapacityPoll = true
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	// busy's container exits too, so only the spare stays tracked.
+	waitForRunnerCount(t, s, 1)
+	before := client.jitIssued()
+	// A late assignment arrives while the not-found spare is still tracked.
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	close(prov.exit)
+	deadline := time.Now().Add(2 * time.Second)
+	for client.jitIssued() == before {
+		if time.Now().After(deadline) {
+			t.Fatal("assignment waited for another message after the not-found spare exited")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestLateCompletionAfterExitGraceIsRecorded(t *testing.T) {
+	client := newMockClient()
+	prov := exitingProvisioner{newMockProvisioner(), make(chan struct{})}
+	s := NewScaler(noopLogger(), client, 1, 1, "test",
+		&RunnerConfig{MaxJobs: 1, Docker: &DockerImage{Image: "test:latest"}}, prov,
+		WithAdmissionSynchronization())
+	defer s.Shutdown(context.Background())
+	s.mu.Lock()
+	s.exitGrace = 10 * time.Millisecond
+	s.mu.Unlock()
+	session := NewDrainSession(nil, s)
+
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	waitForIdle(t, s, 1)
+	name := s.Runners()[0].Name
+	if err := s.HandleJobStarted(context.Background(), &scaleset.JobStarted{RunnerName: name}); err != nil {
+		t.Fatalf("HandleJobStarted: %v", err)
+	}
+	// The container exits and the grace passes before the completion arrives.
+	close(prov.exit)
+	waitForRunnerCount(t, s, 0)
+	if err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: name, Result: "succeeded"}); err != nil {
+		t.Fatalf("HandleJobCompleted: %v", err)
+	}
+	session.zeroCapacityPoll = true
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	select {
+	case <-s.Drained():
+	case <-time.After(2 * time.Second):
+		t.Fatal("max_jobs drain did not see the late completion")
+	}
+	s.mu.Lock()
+	completed, jobs := s.completedJobs, len(s.completedJobInfo)
+	s.mu.Unlock()
+	if completed != 1 || jobs != 1 {
+		t.Fatalf("late completion missing from the receipt: completed=%d jobs=%d", completed, jobs)
+	}
+	// After the receipt, a completion for an unknown runner changes nothing.
+	if err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: name, Result: "succeeded"}); err != nil {
+		t.Fatalf("HandleJobCompleted: %v", err)
+	}
+	s.mu.Lock()
+	completed = s.completedJobs
+	s.mu.Unlock()
+	if completed != 1 {
+		t.Fatalf("completion counted twice or after the receipt: %d", completed)
 	}
 }

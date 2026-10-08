@@ -96,8 +96,10 @@ Docker logs are limited to two 1 MiB files. Before removal, the last 200 lines
 `$XDG_CACHE_HOME/outrunner/diagnostics` (the latest 32 records across all scale sets). The systemd package
 provides a writable cache directory. Exit codes and OOM status go to the journal;
 job output remains in those private diagnostic files. Exited containers bearing this
-scale set's ownership labels are cleaned up on restart. A surviving live container
-blocks startup until its job exits; restart recovery does not stop it.
+scale set's ownership labels are cleaned up on restart. For a surviving live container,
+restart recovery first asks GitHub: if its runner is not registered, or can be
+deregistered because it holds no job, the container is stopped and removed. If GitHub
+refuses because the runner holds a job, startup waits until that job exits.
 
 The credential-free integration test accepts `OUTRUNNER_EXIT_TEST_IMAGE`, pointing
 to a local scratch image containing `provisioner/docker/testdata/exit` compiled

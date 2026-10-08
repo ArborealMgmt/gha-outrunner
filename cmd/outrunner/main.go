@@ -173,6 +173,14 @@ func runWorker(ctx context.Context, externalDrain <-chan struct{}, logger, liste
 	}
 	defer func() { _ = prov.Close() }()
 
+	// A runner left idle by a crashed process never exits on its own; let
+	// cleanup stop it once GitHub confirms it holds no job.
+	if releaser, ok := prov.(interface {
+		SetOrphanReleaser(docker.OrphanReleaser)
+	}); ok {
+		releaser.SetOrphanReleaser(orphanReleaser(client))
+	}
+
 	// Clean up orphans from previous runs
 	if err := cleanupOrphans(ctx, logger, prov, name); err != nil {
 		return fmt.Errorf("runner %s: recover orphans: %w", name, err)
@@ -311,6 +319,38 @@ func labelsMatch(existing []scaleset.Label, desired []scaleset.Label) bool {
 		}
 	}
 	return true
+}
+
+// runnerRegistry is the part of the scaleset client orphan release needs.
+type runnerRegistry interface {
+	GetRunnerByName(ctx context.Context, runnerName string) (*scaleset.RunnerReference, error)
+	RemoveRunner(ctx context.Context, runnerID int64) error
+}
+
+// orphanReleaser deregisters an orphan runner before it may be stopped.
+// GitHub refuses to remove a runner that holds a job, so a refusal keeps the
+// wait; an unregistered runner cannot be given one.
+func orphanReleaser(registry runnerRegistry) docker.OrphanReleaser {
+	return func(ctx context.Context, name string) (bool, error) {
+		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		ref, err := registry.GetRunnerByName(ctx, name)
+		if err != nil {
+			return false, err
+		}
+		if ref == nil {
+			return true, nil
+		}
+		err = registry.RemoveRunner(ctx, int64(ref.ID))
+		switch {
+		case err == nil || errors.Is(err, scaleset.RunnerNotFoundError):
+			return true, nil
+		case errors.Is(err, scaleset.JobStillRunningError):
+			return false, nil
+		default:
+			return false, err
+		}
+	}
 }
 
 // cleanupOrphans removes leftover resources from previous runs.
