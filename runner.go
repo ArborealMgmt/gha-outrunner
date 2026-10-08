@@ -39,6 +39,10 @@ type RunnerState struct {
 	CreatedAt time.Time
 	StartedAt time.Time // when Start() completed (provisioning finished)
 
+	// reaping is set while an idle runner's deregistration is in flight.
+	// Callers hold the scaler's mutex.
+	reaping bool
+
 	done     chan struct{}
 	doneOnce sync.Once
 }
