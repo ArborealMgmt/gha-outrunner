@@ -53,6 +53,8 @@ type Scaler struct {
 	assignedJobs          int
 	// servedSinceStatistics counts completions since assignedJobs was last
 	// replaced. Only refill subtracts it; drain proof uses GitHub's figure.
+	// The listener replaces assignedJobs in the same message as a completion,
+	// so this matters only if cleanup wins that race.
 	servedSinceStatistics int
 
 	lifecycleCtx    context.Context
@@ -226,8 +228,9 @@ func (s *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 			FinishedAt:         jobInfo.FinishTime,
 		})
 		s.completedJobs++
-		// The finished job no longer holds an assignment, but assignedJobs may
-		// predate its completion until the listener's next statistics arrive.
+		// The finished job no longer holds an assignment, but assignedJobs
+		// predates its completion until the listener applies this message's
+		// statistics, which it does right after this callback returns.
 		s.servedSinceStatistics++
 		s.idleSince = time.Now()
 		if s.runner.MaxJobs > 0 && s.completedJobs >= s.runner.MaxJobs && !s.draining {
@@ -327,8 +330,10 @@ func (s *Scaler) Drained() <-chan struct{} {
 
 // Shutdown cancels all runner goroutines and waits for them to finish.
 func (s *Scaler) Shutdown(ctx context.Context) {
-	s.mu.Lock()
+	// Cancel before taking the lock: a refill holds s.mu across its JIT
+	// request, and cancellation is what ends that request promptly.
 	s.lifecycleCancel()
+	s.mu.Lock()
 	if s.idleTimer != nil {
 		s.idleTimer.Stop()
 	}
@@ -506,11 +511,16 @@ func (s *Scaler) removeRunner(name string, cleaned bool) {
 	}
 }
 
+// refillTimeout bounds the JIT request a refill makes while holding s.mu.
+const refillTimeout = 30 * time.Second
+
 // refillLocked serves assignments that arrived while a runner that just
 // finished a job still held the last slot. The listener re-evaluates capacity
 // only when a message arrives, and GitHub's long poll can hold the next one
 // for ~50s, so without this a job assigned during cleanup waits out the poll
-// on an otherwise idle host. Failed provisioning never refills here: the next
+// on an otherwise idle host. Like the listener's own nil-message path, this
+// relies on GitHub's TotalAssignedJobs excluding completed jobs; refill only
+// acts on those statistics ~50s sooner. Failed provisioning never refills here: the next
 // listener message retries it, so a broken image cannot spin. Callers hold
 // s.mu inside a tracked lifecycle goroutine, so the wait group is positive
 // when Add runs.
@@ -534,7 +544,9 @@ func (s *Scaler) refillLocked() {
 			return
 		}
 		pending := max(0, s.assignedJobs-s.servedSinceStatistics)
-		if _, err := s.reconcileLocked(s.lifecycleCtx, pending); err != nil {
+		ctx, cancel := context.WithTimeout(s.lifecycleCtx, refillTimeout)
+		defer cancel()
+		if _, err := s.reconcileLocked(ctx, pending); err != nil {
 			// The next listener message retries with fresh statistics.
 			s.logger.Warn("Refill after cleanup failed", slog.String("error", err.Error()))
 		}

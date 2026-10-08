@@ -22,7 +22,9 @@ type mockClient struct {
 	mu          sync.Mutex
 	nextID      int
 	removeCount atomic.Int32
-	jitErr      error // if set, GenerateJitRunnerConfig returns this error
+	jitErr      error         // if set, GenerateJitRunnerConfig returns this error
+	jitBlock    chan struct{} // if set, JIT calls after the first block until closed or ctx ends
+	jitCalls    atomic.Int32
 	removeErr   error
 }
 
@@ -30,7 +32,14 @@ func newMockClient() *mockClient {
 	return &mockClient{nextID: 1}
 }
 
-func (m *mockClient) GenerateJitRunnerConfig(_ context.Context, setting *scaleset.RunnerScaleSetJitRunnerSetting, _ int) (*scaleset.RunnerScaleSetJitRunnerConfig, error) {
+func (m *mockClient) GenerateJitRunnerConfig(ctx context.Context, setting *scaleset.RunnerScaleSetJitRunnerSetting, _ int) (*scaleset.RunnerScaleSetJitRunnerConfig, error) {
+	if m.jitCalls.Add(1) > 1 && m.jitBlock != nil {
+		select {
+		case <-m.jitBlock:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	if m.jitErr != nil {
 		return nil, m.jitErr
 	}
@@ -62,6 +71,7 @@ type mockProvisioner struct {
 	startErr error
 	stopErr  error
 	startCh  chan struct{} // if set, Start blocks until closed
+	stopCh   chan struct{} // if set, Stop blocks until closed
 }
 
 func newMockProvisioner() *mockProvisioner {
@@ -86,6 +96,9 @@ func (m *mockProvisioner) Start(ctx context.Context, req *RunnerRequest) error {
 }
 
 func (m *mockProvisioner) Stop(_ context.Context, name string) error {
+	if m.stopCh != nil {
+		<-m.stopCh
+	}
 	m.mu.Lock()
 	m.stopped = append(m.stopped, name)
 	m.mu.Unlock()
@@ -1188,6 +1201,7 @@ func waitForRunnerCount(t *testing.T, s *Scaler, want int) []RunnerSnapshot {
 func TestCleanupRefillsAssignmentWithoutWaitingForNextMessage(t *testing.T) {
 	client := newMockClient()
 	prov := newMockProvisioner()
+	prov.stopCh = make(chan struct{}) // cleanup finishes only after the statistics below
 	s := NewScaler(noopLogger(), client, 1, 1, "test",
 		&RunnerConfig{Docker: &DockerImage{Image: "test:latest"}}, prov)
 	defer s.Shutdown(context.Background())
@@ -1207,6 +1221,7 @@ func TestCleanupRefillsAssignmentWithoutWaitingForNextMessage(t *testing.T) {
 	} else if count != 1 {
 		t.Fatalf("expected the finishing runner to hold the slot, got %d", count)
 	}
+	close(prov.stopCh)
 
 	// No further listener message: cleanup alone must provision the next runner.
 	deadline := time.Now().Add(2 * time.Second)
@@ -1342,5 +1357,122 @@ func TestSynchronizedDrainWaitsForGitHubCountNotLocalCompletion(t *testing.T) {
 	case <-s.Drained():
 	case <-time.After(2 * time.Second):
 		t.Fatal("scaler did not drain after GitHub reported zero assigned jobs")
+	}
+}
+
+// Cleanup that beats the listener's next statistics must subtract the job it
+// just served: stale assigned=1 is that job, so nothing is pending.
+func TestCleanupBeforeStatisticsDoesNotRefillServedJob(t *testing.T) {
+	client := newMockClient()
+	prov := newMockProvisioner()
+	s := NewScaler(noopLogger(), client, 1, 1, "test",
+		&RunnerConfig{Docker: &DockerImage{Image: "test:latest"}}, prov)
+	defer s.Shutdown(context.Background())
+
+	if _, err := s.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	first := waitForRunnerCount(t, s, 1)[0].Name
+	if err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: first, Result: "succeeded"}); err != nil {
+		t.Fatalf("HandleJobCompleted: %v", err)
+	}
+	waitForRunnerCount(t, s, 0)
+	time.Sleep(50 * time.Millisecond)
+	if n := len(s.Runners()); n != 0 {
+		t.Fatalf("stale statistics refilled the served job: %d runners", n)
+	}
+	if client.nextID != 2 {
+		t.Fatalf("expected exactly one JIT runner, next ID is %d", client.nextID)
+	}
+}
+
+// Stale assigned=2 with one completion still leaves one queued job to serve.
+func TestCleanupBeforeStatisticsRefillsRemainingAssignment(t *testing.T) {
+	client := newMockClient()
+	prov := newMockProvisioner()
+	s := NewScaler(noopLogger(), client, 1, 1, "test",
+		&RunnerConfig{Docker: &DockerImage{Image: "test:latest"}}, prov)
+	defer s.Shutdown(context.Background())
+
+	if _, err := s.HandleDesiredRunnerCount(context.Background(), 2); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	first := waitForRunnerCount(t, s, 1)[0].Name
+	if err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: first, Result: "succeeded"}); err != nil {
+		t.Fatalf("HandleJobCompleted: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if runners := s.Runners(); len(runners) == 1 && runners[0].Name != first {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("remaining assignment was not refilled; runners %v", s.Runners())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if client.nextID != 3 {
+		t.Fatalf("expected exactly two JIT runners, next ID is %d", client.nextID)
+	}
+}
+
+// With two slots, two stale assignments and one completion, the busy runner
+// already covers the remaining job, so refill adds nothing.
+func TestCleanupBeforeStatisticsCountsBusyRunners(t *testing.T) {
+	client := newMockClient()
+	prov := newMockProvisioner()
+	s := NewScaler(noopLogger(), client, 1, 2, "test",
+		&RunnerConfig{Docker: &DockerImage{Image: "test:latest"}}, prov)
+	defer s.Shutdown(context.Background())
+
+	if _, err := s.HandleDesiredRunnerCount(context.Background(), 2); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	runners := waitForRunnerCount(t, s, 2)
+	if err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: runners[0].Name, Result: "succeeded"}); err != nil {
+		t.Fatalf("HandleJobCompleted: %v", err)
+	}
+	remaining := waitForRunnerCount(t, s, 1)
+	time.Sleep(50 * time.Millisecond)
+	if got := s.Runners(); len(got) != 1 || got[0].Name != remaining[0].Name {
+		t.Fatalf("expected only the busy runner, got %v", got)
+	}
+	if client.nextID != 3 {
+		t.Fatalf("expected exactly two JIT runners, next ID is %d", client.nextID)
+	}
+}
+
+// Shutdown must cancel a refill's in-flight JIT request rather than queue
+// behind the lock the refill holds.
+func TestShutdownCancelsRefillJITRequest(t *testing.T) {
+	client := newMockClient()
+	client.jitBlock = make(chan struct{})
+	defer close(client.jitBlock)
+	prov := newMockProvisioner()
+	s := NewScaler(noopLogger(), client, 1, 1, "test",
+		&RunnerConfig{Docker: &DockerImage{Image: "test:latest"}}, prov)
+
+	if _, err := s.HandleDesiredRunnerCount(context.Background(), 2); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	first := waitForRunnerCount(t, s, 1)[0].Name
+	if err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: first, Result: "succeeded"}); err != nil {
+		t.Fatalf("HandleJobCompleted: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for client.jitCalls.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("refill never requested a JIT config")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	s.Shutdown(ctx)
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Shutdown waited %s behind the refill's JIT request", elapsed)
 	}
 }
