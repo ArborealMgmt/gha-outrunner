@@ -39,9 +39,12 @@ type RunnerState struct {
 	CreatedAt time.Time
 	StartedAt time.Time // when Start() completed (provisioning finished)
 
-	// reaping is set while an idle runner's deregistration is in flight.
-	// Callers hold the scaler's mutex.
+	// reaping is set while an idle runner's deregistration is in flight and
+	// stays set once GitHub accepts it. reaped records that acceptance, so the
+	// runner's removal refills like a served one. Callers hold the scaler's
+	// mutex.
 	reaping bool
+	reaped  bool
 
 	done     chan struct{}
 	doneOnce sync.Once

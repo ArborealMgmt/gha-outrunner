@@ -243,7 +243,8 @@ func (s *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 				slog.Int("completedJobs", s.completedJobs),
 				slog.Int("maxJobs", s.runner.MaxJobs),
 			)
-			s.reapIdleLocked()
+			// No reap here: assignedJobs predates this message's statistics,
+			// which HandleDesiredRunnerCount applies (and reaps on) next.
 		}
 	}
 	s.mu.Unlock()
@@ -501,6 +502,10 @@ func (s *Scaler) removeRunner(name string, cleaned bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	servedJob := s.completedRunners[name]
+	reaped := false
+	if state, ok := s.runners[name]; ok {
+		reaped = state.reaped
+	}
 	delete(s.runners, name)
 	s.idleSince = time.Now()
 	delete(s.completedRunners, name)
@@ -508,7 +513,9 @@ func (s *Scaler) removeRunner(name string, cleaned bool) {
 	if !cleaned {
 		s.drainFailed = true
 	}
-	if cleaned && servedJob {
+	// A reaped runner provisioned successfully, so refilling after it cannot
+	// spin the way a failed start could.
+	if cleaned && (servedJob || reaped) {
 		s.refillLocked()
 	}
 	s.armIdleTimerLocked()
@@ -604,16 +611,38 @@ func (s *Scaler) reapRunner(state *RunnerState) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	state.reaping = false
+	_, watched := s.provisioner.(ExitWatcher)
 	switch {
-	case err == nil || errors.Is(err, scaleset.RunnerNotFoundError):
+	case err == nil:
+		if state.Phase != RunnerIdle {
+			// JobStarted arrived while the request was in flight. GitHub
+			// accepted anyway; let the job's own messages and the exit
+			// watcher finish this runner rather than stopping it here.
+			s.logger.Warn("Reaped runner had already started a job", slog.String("name", state.Name))
+			return
+		}
 		s.logger.Info("Reaped idle runner on a draining host", slog.String("name", state.Name))
-		// The lifecycle goroutine stops the container; its own deregistration
-		// then finds the runner already gone, which counts as success.
+		// Stays reaping so no later pass counts it as idle again. The
+		// lifecycle goroutine stops the container; its own deregistration
+		// then finds the runner gone, which counts as success.
+		state.reaped = true
+		state.Phase = RunnerStopping
+		state.SignalDone()
+	case errors.Is(err, scaleset.RunnerNotFoundError) && watched:
+		// Either an earlier request succeeded and its response was lost, or
+		// the ephemeral runner served a job and deregistered itself before
+		// its messages arrived. Its container exits on its own either way;
+		// the exit watcher and the job's messages record what happened.
+		s.logger.Info("Idle runner already deregistered; waiting for its exit", slog.String("name", state.Name))
+	case errors.Is(err, scaleset.RunnerNotFoundError):
+		state.reaped = true
+		state.Phase = RunnerStopping
 		state.SignalDone()
 	case errors.Is(err, scaleset.JobStillRunningError):
+		state.reaping = false
 		s.logger.Info("Idle runner took a job before it could be reaped", slog.String("name", state.Name))
 	default:
+		state.reaping = false
 		// The next listener message retries.
 		s.logger.Warn("Idle runner reap failed", slog.String("name", state.Name), slog.String("error", err.Error()))
 	}
