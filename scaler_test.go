@@ -26,6 +26,14 @@ type mockClient struct {
 	jitBlock    chan struct{} // if set, JIT calls after the first block until closed or ctx ends
 	jitCalls    atomic.Int32
 	removeErr   error
+	removeFn    func(runnerID int64) error // if set, overrides removeErr per call
+}
+
+// jitIssued returns how many JIT configs the mock has handed out.
+func (m *mockClient) jitIssued() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.nextID - 1
 }
 
 func newMockClient() *mockClient {
@@ -58,8 +66,11 @@ func (m *mockClient) GenerateJitRunnerConfig(ctx context.Context, setting *scale
 	}, nil
 }
 
-func (m *mockClient) RemoveRunner(_ context.Context, _ int64) error {
+func (m *mockClient) RemoveRunner(_ context.Context, runnerID int64) error {
 	m.removeCount.Add(1)
+	if m.removeFn != nil {
+		return m.removeFn(runnerID)
+	}
 	return m.removeErr
 }
 
@@ -96,8 +107,11 @@ func (m *mockProvisioner) Start(ctx context.Context, req *RunnerRequest) error {
 }
 
 func (m *mockProvisioner) Stop(_ context.Context, name string) error {
-	if m.stopCh != nil {
-		<-m.stopCh
+	m.mu.Lock()
+	stopCh := m.stopCh
+	m.mu.Unlock()
+	if stopCh != nil {
+		<-stopCh
 	}
 	m.mu.Lock()
 	m.stopped = append(m.stopped, name)
@@ -1474,5 +1488,383 @@ func TestShutdownCancelsRefillJITRequest(t *testing.T) {
 	s.Shutdown(ctx)
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("Shutdown waited %s behind the refill's JIT request", elapsed)
+	}
+}
+
+// newDrainingPair builds a synchronized-drain scaler with two slots and
+// max_jobs 1: one runner serves the only job, the other is spawned for a
+// second assignment that has not reached it.
+func newDrainingPair(t *testing.T, client *mockClient, prov Provisioner) (*Scaler, *DrainSession, RunnerSnapshot, RunnerSnapshot) {
+	t.Helper()
+	s := NewScaler(noopLogger(), client, 1, 2, "test",
+		&RunnerConfig{MaxJobs: 1, Docker: &DockerImage{Image: "test:latest"}}, prov,
+		WithAdmissionSynchronization())
+	session := NewDrainSession(nil, s)
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 2); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	waitForIdle(t, s, 2)
+	// Either runner can take the job; call the one that does "busy".
+	runners := s.Runners()
+	busy, spare := runners[0], runners[1]
+	if err := s.HandleJobStarted(context.Background(), &scaleset.JobStarted{RunnerName: busy.Name}); err != nil {
+		t.Fatalf("HandleJobStarted: %v", err)
+	}
+	return s, session, busy, spare
+}
+
+// waitForIdle polls until want runners have finished provisioning.
+func waitForIdle(t *testing.T, s *Scaler, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		idle := 0
+		for _, r := range s.Runners() {
+			if r.Phase == RunnerIdle {
+				idle++
+			}
+		}
+		if idle == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected %d idle runners, got %d", want, idle)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestDrainReapsIdleRunnerWhoseAssignmentWentAway(t *testing.T) {
+	client := newMockClient()
+	s, session, busy, _ := newDrainingPair(t, client, newMockProvisioner())
+	defer s.Shutdown(context.Background())
+
+	// The only job completes and max_jobs closes admission. GitHub then
+	// reports zero assigned jobs on a zero-capacity poll: the second
+	// assignment was cancelled or went elsewhere.
+	if err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: busy.Name, Result: "succeeded"}); err != nil {
+		t.Fatalf("HandleJobCompleted: %v", err)
+	}
+	session.zeroCapacityPoll = true
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	select {
+	case <-s.Drained():
+	case <-time.After(2 * time.Second):
+		t.Fatalf("draining host never drained; runners %v", s.Runners())
+	}
+	if n := len(s.Runners()); n != 0 {
+		t.Fatalf("expected the idle runner to be reaped, %d runners remain", n)
+	}
+}
+
+func TestDrainKeepsIdleRunnerWhileAnAssignmentIsPending(t *testing.T) {
+	client := newMockClient()
+	s, session, busy, spare := newDrainingPair(t, client, newMockProvisioner())
+	defer s.Shutdown(context.Background())
+
+	if err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: busy.Name, Result: "succeeded"}); err != nil {
+		t.Fatalf("HandleJobCompleted: %v", err)
+	}
+	// GitHub still counts the second assignment: the spare must serve it.
+	session.zeroCapacityPoll = true
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	waitForRunnerCount(t, s, 1)
+	time.Sleep(50 * time.Millisecond)
+	if got := s.Runners(); len(got) != 1 || got[0].Name != spare.Name {
+		t.Fatalf("expected the spare runner to stay for its assignment, got %v", got)
+	}
+	select {
+	case <-s.Drained():
+		t.Fatal("drained while an assignment was pending")
+	default:
+	}
+}
+
+func TestDrainKeepsRunnerThatTookAJobBeforeReap(t *testing.T) {
+	client := newMockClient()
+	var refused atomic.Bool
+	var spareID atomic.Int64
+	client.removeFn = func(id int64) error {
+		if id == spareID.Load() && refused.CompareAndSwap(false, true) {
+			return fmt.Errorf("remove: %w", scaleset.JobStillRunningError)
+		}
+		return nil
+	}
+	prov := newMockProvisioner()
+	s, session, busy, spare := newDrainingPair(t, client, prov)
+	defer s.Shutdown(context.Background())
+	spareID.Store(int64(spare.RunnerID))
+
+	if err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: busy.Name, Result: "succeeded"}); err != nil {
+		t.Fatalf("HandleJobCompleted: %v", err)
+	}
+	session.zeroCapacityPoll = true
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for !refused.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("reap was never attempted")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	waitForRunnerCount(t, s, 1)
+	time.Sleep(50 * time.Millisecond)
+	if got := s.Runners(); len(got) != 1 || got[0].Name != spare.Name {
+		t.Fatalf("a runner GitHub says is busy must not be stopped; got %v", got)
+	}
+	for _, name := range prov.stoppedNames() {
+		if name == spare.Name {
+			t.Fatal("stopped the container of a runner GitHub reported busy")
+		}
+	}
+
+	// It really did take the job; once that completes the host drains.
+	if err := s.HandleJobStarted(context.Background(), &scaleset.JobStarted{RunnerName: spare.Name}); err != nil {
+		t.Fatalf("HandleJobStarted: %v", err)
+	}
+	if err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: spare.Name, Result: "succeeded"}); err != nil {
+		t.Fatalf("HandleJobCompleted: %v", err)
+	}
+	waitForRunnerCount(t, s, 0)
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	select {
+	case <-s.Drained():
+	case <-time.After(2 * time.Second):
+		t.Fatal("host did not drain after the late job completed")
+	}
+}
+
+func TestIdleRunnerIsNotReapedBeforeDrain(t *testing.T) {
+	client := newMockClient()
+	s := NewScaler(noopLogger(), client, 1, 1, "test",
+		&RunnerConfig{Docker: &DockerImage{Image: "test:latest"}}, newMockProvisioner(),
+		WithAdmissionSynchronization())
+	defer s.Shutdown(context.Background())
+	session := NewDrainSession(nil, s)
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	waitForIdle(t, s, 1)
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := len(s.Runners()); n != 1 || client.removeCount.Load() != 0 {
+		t.Fatalf("admission is open: expected the idle runner untouched, runners=%d removes=%d", n, client.removeCount.Load())
+	}
+}
+
+func TestExternalDrainReapsIdleRunner(t *testing.T) {
+	client := newMockClient()
+	s := NewScaler(noopLogger(), client, 1, 1, "test",
+		&RunnerConfig{MaxJobs: 5, Docker: &DockerImage{Image: "test:latest"}}, newMockProvisioner(),
+		WithAdmissionSynchronization())
+	defer s.Shutdown(context.Background())
+	session := NewDrainSession(nil, s)
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	waitForIdle(t, s, 1)
+	// The assignment went away before the job started.
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	if err := s.RequestDrain(); err != nil {
+		t.Fatalf("RequestDrain: %v", err)
+	}
+	waitForRunnerCount(t, s, 0)
+	session.zeroCapacityPoll = true
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	select {
+	case <-s.Drained():
+	case <-time.After(2 * time.Second):
+		t.Fatal("external drain never completed with an idle runner")
+	}
+}
+
+// watchingProvisioner is a mockProvisioner whose containers never exit on
+// their own, so only an explicit stop ends a runner.
+type watchingProvisioner struct{ *mockProvisioner }
+
+func (w watchingProvisioner) Wait(ctx context.Context, _ string) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestReapAfterProvisioningFinishesOnAClosedHost(t *testing.T) {
+	client := newMockClient()
+	prov := newMockProvisioner()
+	prov.startCh = make(chan struct{})
+	s := NewScaler(noopLogger(), client, 1, 1, "test",
+		&RunnerConfig{MaxJobs: 5, Docker: &DockerImage{Image: "test:latest"}}, prov,
+		WithAdmissionSynchronization())
+	defer s.Shutdown(context.Background())
+	session := NewDrainSession(nil, s)
+
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	waitForRunnerCount(t, s, 1)
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	if err := s.RequestDrain(); err != nil {
+		t.Fatalf("RequestDrain: %v", err)
+	}
+	session.zeroCapacityPoll = true
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	if client.removeCount.Load() != 0 {
+		t.Fatal("reaped a runner that was still provisioning")
+	}
+	// Provisioning finishes after admission closed: no further message.
+	close(prov.startCh)
+	select {
+	case <-s.Drained():
+	case <-time.After(2 * time.Second):
+		t.Fatalf("runner provisioned after drain was never reaped; runners %v", s.Runners())
+	}
+}
+
+func TestReapIssuesOneRequestPerRunner(t *testing.T) {
+	client := newMockClient()
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	var spareID atomic.Int64
+	var spareRemoves atomic.Int32
+	client.removeFn = func(id int64) error {
+		if id == spareID.Load() {
+			spareRemoves.Add(1)
+			<-release
+		}
+		return nil
+	}
+	s, session, busy, spare := newDrainingPair(t, client, newMockProvisioner())
+	defer s.Shutdown(context.Background())
+	spareID.Store(int64(spare.RunnerID))
+
+	if err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: busy.Name, Result: "succeeded"}); err != nil {
+		t.Fatalf("HandleJobCompleted: %v", err)
+	}
+	waitForRunnerCount(t, s, 1)
+	session.zeroCapacityPoll = true
+	for range 3 {
+		if _, err := session.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+			t.Fatalf("HandleDesiredRunnerCount: %v", err)
+		}
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := spareRemoves.Load(); n != 1 {
+		t.Fatalf("expected one in-flight deregistration for the spare, got %d", n)
+	}
+	releaseOnce.Do(func() { close(release) })
+	waitForRunnerCount(t, s, 0)
+}
+
+func TestReapedRunnerRefillsALateAssignment(t *testing.T) {
+	client := newMockClient()
+	prov := newMockProvisioner()
+	s, session, busy, _ := newDrainingPair(t, client, prov)
+	defer s.Shutdown(context.Background())
+
+	if err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: busy.Name, Result: "succeeded"}); err != nil {
+		t.Fatalf("HandleJobCompleted: %v", err)
+	}
+	waitForRunnerCount(t, s, 1)
+	// Hold the reaped container's stop so the late assignment arrives while
+	// it is still tracked.
+	gate := make(chan struct{})
+	prov.mu.Lock()
+	prov.stopCh = gate
+	prov.mu.Unlock()
+	session.zeroCapacityPoll = true
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for client.removeCount.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("spare was never reaped")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	before := client.jitIssued()
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	close(gate)
+	deadline = time.Now().Add(2 * time.Second)
+	for client.jitIssued() == before {
+		if time.Now().After(deadline) {
+			t.Fatal("late assignment waited for another message after the reap")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	waitForIdle(t, s, 1)
+}
+
+func TestReapNotFoundWithoutWatcherCountsAsReaped(t *testing.T) {
+	client := newMockClient()
+	client.removeFn = func(int64) error { return fmt.Errorf("remove: %w", scaleset.RunnerNotFoundError) }
+	s, session, busy, _ := newDrainingPair(t, client, newMockProvisioner())
+	defer s.Shutdown(context.Background())
+
+	if err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: busy.Name, Result: "succeeded"}); err != nil {
+		t.Fatalf("HandleJobCompleted: %v", err)
+	}
+	session.zeroCapacityPoll = true
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	select {
+	case <-s.Drained():
+	case <-time.After(2 * time.Second):
+		t.Fatalf("not-found reap did not drain; runners %v", s.Runners())
+	}
+}
+
+func TestReapNotFoundWithWatcherWaitsForExit(t *testing.T) {
+	client := newMockClient()
+	var spareID atomic.Int64
+	client.removeFn = func(id int64) error {
+		if id == spareID.Load() {
+			return fmt.Errorf("remove: %w", scaleset.RunnerNotFoundError)
+		}
+		return nil
+	}
+	s, session, busy, spare := newDrainingPair(t, client, watchingProvisioner{newMockProvisioner()})
+	defer s.Shutdown(context.Background())
+	spareID.Store(int64(spare.RunnerID))
+
+	if err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: busy.Name, Result: "succeeded"}); err != nil {
+		t.Fatalf("HandleJobCompleted: %v", err)
+	}
+	session.zeroCapacityPoll = true
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	waitForRunnerCount(t, s, 1)
+	time.Sleep(50 * time.Millisecond)
+	// The runner may have served a job whose messages are late: only its own
+	// exit or completion may end it.
+	if got := s.Runners(); len(got) != 1 || got[0].Name != spare.Name {
+		t.Fatalf("expected the spare kept until its container exits, got %v", got)
+	}
+	select {
+	case <-s.Drained():
+		t.Fatal("drained before the not-found runner's exit was observed")
+	default:
 	}
 }

@@ -110,7 +110,9 @@ func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 
 	s.assignedJobs = count
 	s.servedSinceStatistics = 0
-	return s.reconcileLocked(ctx, count)
+	current, err := s.reconcileLocked(ctx, count)
+	s.reapIdleLocked()
+	return current, err
 }
 
 // reconcileLocked spawns runners until the tracked set covers count assigned
@@ -241,6 +243,8 @@ func (s *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 				slog.Int("completedJobs", s.completedJobs),
 				slog.Int("maxJobs", s.runner.MaxJobs),
 			)
+			// No reap here: assignedJobs predates this message's statistics,
+			// which HandleDesiredRunnerCount applies (and reaps on) next.
 		}
 	}
 	s.mu.Unlock()
@@ -283,6 +287,7 @@ func (s *Scaler) RequestDrain() error {
 	if len(s.runners) == 0 {
 		return s.finishDrainLocked()
 	}
+	s.reapIdleLocked()
 	return nil
 }
 
@@ -411,6 +416,8 @@ func (s *Scaler) runRunnerLifecycle(state *RunnerState, req *RunnerRequest) {
 		s.logger.Info("Runner provisioned", slog.String("name", name))
 	}
 	state.StartedAt = time.Now()
+	// Admission may have closed while this runner was provisioning.
+	s.reapIdleLocked()
 	s.mu.Unlock()
 
 	// The environment may disappear without any GitHub completion message.
@@ -495,6 +502,10 @@ func (s *Scaler) removeRunner(name string, cleaned bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	servedJob := s.completedRunners[name]
+	reaped := false
+	if state, ok := s.runners[name]; ok {
+		reaped = state.reaped
+	}
 	delete(s.runners, name)
 	s.idleSince = time.Now()
 	delete(s.completedRunners, name)
@@ -502,7 +513,9 @@ func (s *Scaler) removeRunner(name string, cleaned bool) {
 	if !cleaned {
 		s.drainFailed = true
 	}
-	if cleaned && servedJob {
+	// A reaped runner provisioned successfully, so refilling after it cannot
+	// spin the way a failed start could.
+	if cleaned && (servedJob || reaped) {
 		s.refillLocked()
 	}
 	s.armIdleTimerLocked()
@@ -551,6 +564,88 @@ func (s *Scaler) refillLocked() {
 			s.logger.Warn("Refill after cleanup failed", slog.String("error", err.Error()))
 		}
 	}()
+}
+
+// reapTimeout bounds one idle runner's deregistration request.
+const reapTimeout = 10 * time.Second
+
+// reapIdleLocked deregisters provisioned runners that no assignment needs once
+// admission has closed. Nothing else removes an idle runner, so without this a
+// draining host whose assignment was cancelled or requeued elsewhere never
+// drains. GitHub refuses to remove a runner that has taken a job
+// (JobStillRunningError), so deregistration comes first and the container is
+// stopped only once GitHub agrees the runner is idle. Callers hold s.mu.
+func (s *Scaler) reapIdleLocked() {
+	if !s.draining || s.drainFailed || s.lifecycleCtx.Err() != nil {
+		return
+	}
+	running := 0
+	var idle []*RunnerState
+	for _, state := range s.runners {
+		switch {
+		case s.completedRunners[state.Name]:
+			// Its job is done: servedSinceStatistics already accounts for it.
+		case state.Phase == RunnerRunning:
+			running++
+		case state.Phase == RunnerIdle && !state.reaping:
+			idle = append(idle, state)
+		}
+	}
+	// Assignments not yet started on a runner may still land on an idle one.
+	pending := max(0, s.assignedJobs-s.servedSinceStatistics-running)
+	if len(idle) <= pending {
+		return
+	}
+	for _, state := range idle[pending:] {
+		state.reaping = true
+		s.wg.Add(1)
+		go s.reapRunner(state)
+	}
+}
+
+func (s *Scaler) reapRunner(state *RunnerState) {
+	defer s.wg.Done()
+	ctx, cancel := context.WithTimeout(s.lifecycleCtx, reapTimeout)
+	err := s.client.RemoveRunner(ctx, int64(state.RunnerID))
+	cancel()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, watched := s.provisioner.(ExitWatcher)
+	switch {
+	case err == nil:
+		if state.Phase != RunnerIdle {
+			// JobStarted arrived while the request was in flight. GitHub
+			// accepted anyway; let the job's own messages and the exit
+			// watcher finish this runner rather than stopping it here.
+			s.logger.Warn("Reaped runner had already started a job", slog.String("name", state.Name))
+			return
+		}
+		s.logger.Info("Reaped idle runner on a draining host", slog.String("name", state.Name))
+		// Stays reaping so no later pass counts it as idle again. The
+		// lifecycle goroutine stops the container; its own deregistration
+		// then finds the runner gone, which counts as success.
+		state.reaped = true
+		state.Phase = RunnerStopping
+		state.SignalDone()
+	case errors.Is(err, scaleset.RunnerNotFoundError) && watched:
+		// Either an earlier request succeeded and its response was lost, or
+		// the ephemeral runner served a job and deregistered itself before
+		// its messages arrived. Its container exits on its own either way;
+		// the exit watcher and the job's messages record what happened.
+		s.logger.Info("Idle runner already deregistered; waiting for its exit", slog.String("name", state.Name))
+	case errors.Is(err, scaleset.RunnerNotFoundError):
+		state.reaped = true
+		state.Phase = RunnerStopping
+		state.SignalDone()
+	case errors.Is(err, scaleset.JobStillRunningError):
+		state.reaping = false
+		s.logger.Info("Idle runner took a job before it could be reaped", slog.String("name", state.Name))
+	default:
+		state.reaping = false
+		// The next listener message retries.
+		s.logger.Warn("Idle runner reap failed", slog.String("name", state.Name), slog.String("error", err.Error()))
+	}
 }
 
 // finishDrainLocked publishes the terminal proof while s.mu is held.
