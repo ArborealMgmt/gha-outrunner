@@ -51,6 +51,9 @@ type Scaler struct {
 	synchronizeAdmission  bool
 	admissionSynchronized bool
 	assignedJobs          int
+	// servedSinceStatistics counts completions since assignedJobs was last
+	// replaced. Only refill subtracts it; drain proof uses GitHub's figure.
+	servedSinceStatistics int
 
 	lifecycleCtx    context.Context
 	lifecycleCancel context.CancelFunc
@@ -104,6 +107,13 @@ func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 	defer s.mu.Unlock()
 
 	s.assignedJobs = count
+	s.servedSinceStatistics = 0
+	return s.reconcileLocked(ctx, count)
+}
+
+// reconcileLocked spawns runners until the tracked set covers count assigned
+// jobs, capped at maxRunners. Callers hold s.mu.
+func (s *Scaler) reconcileLocked(ctx context.Context, count int) (int, error) {
 	if s.draining && !s.synchronizeAdmission {
 		return len(s.runners), nil
 	}
@@ -216,6 +226,9 @@ func (s *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 			FinishedAt:         jobInfo.FinishTime,
 		})
 		s.completedJobs++
+		// The finished job no longer holds an assignment, but assignedJobs may
+		// predate its completion until the listener's next statistics arrive.
+		s.servedSinceStatistics++
 		s.idleSince = time.Now()
 		if s.runner.MaxJobs > 0 && s.completedJobs >= s.runner.MaxJobs && !s.draining {
 			s.draining = true
@@ -476,6 +489,7 @@ func (s *Scaler) cleanupRunner(state *RunnerState) bool {
 func (s *Scaler) removeRunner(name string, cleaned bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	servedJob := s.completedRunners[name]
 	delete(s.runners, name)
 	s.idleSince = time.Now()
 	delete(s.completedRunners, name)
@@ -483,10 +497,48 @@ func (s *Scaler) removeRunner(name string, cleaned bool) {
 	if !cleaned {
 		s.drainFailed = true
 	}
+	if cleaned && servedJob {
+		s.refillLocked()
+	}
 	s.armIdleTimerLocked()
 	if s.draining && !s.drainFailed && len(s.runners) == 0 {
 		_ = s.finishDrainLocked()
 	}
+}
+
+// refillLocked serves assignments that arrived while a runner that just
+// finished a job still held the last slot. The listener re-evaluates capacity
+// only when a message arrives, and GitHub's long poll can hold the next one
+// for ~50s, so without this a job assigned during cleanup waits out the poll
+// on an otherwise idle host. Failed provisioning never refills here: the next
+// listener message retries it, so a broken image cannot spin. Callers hold
+// s.mu inside a tracked lifecycle goroutine, so the wait group is positive
+// when Add runs.
+func (s *Scaler) refillLocked() {
+	if s.lifecycleCtx.Err() != nil || s.drainFailed {
+		return
+	}
+	if s.draining && !s.synchronizeAdmission {
+		return
+	}
+	pending := max(0, s.assignedJobs-s.servedSinceStatistics)
+	if min(s.maxRunners, pending) <= len(s.runners) {
+		return
+	}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.lifecycleCtx.Err() != nil {
+			return
+		}
+		pending := max(0, s.assignedJobs-s.servedSinceStatistics)
+		if _, err := s.reconcileLocked(s.lifecycleCtx, pending); err != nil {
+			// The next listener message retries with fresh statistics.
+			s.logger.Warn("Refill after cleanup failed", slog.String("error", err.Error()))
+		}
+	}()
 }
 
 // finishDrainLocked publishes the terminal proof while s.mu is held.

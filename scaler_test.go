@@ -1168,3 +1168,179 @@ func TestMissingJITIdentityDoesNotProvisionUnrecoverableRunner(t *testing.T) {
 		t.Fatalf("admitted runner without cleanup identity: count=%d err=%v", count, err)
 	}
 }
+
+// waitForRunnerCount polls until the scaler tracks want runners.
+func waitForRunnerCount(t *testing.T, s *Scaler, want int) []RunnerSnapshot {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		runners := s.Runners()
+		if len(runners) == want {
+			return runners
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected %d runners, got %d", want, len(runners))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestCleanupRefillsAssignmentWithoutWaitingForNextMessage(t *testing.T) {
+	client := newMockClient()
+	prov := newMockProvisioner()
+	s := NewScaler(noopLogger(), client, 1, 1, "test",
+		&RunnerConfig{Docker: &DockerImage{Image: "test:latest"}}, prov)
+	defer s.Shutdown(context.Background())
+
+	if _, err := s.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	first := waitForRunnerCount(t, s, 1)[0].Name
+
+	// The completion message's statistics already count the next assignment,
+	// but the finished runner still holds the only slot when they arrive.
+	if err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: first, Result: "succeeded"}); err != nil {
+		t.Fatalf("HandleJobCompleted: %v", err)
+	}
+	if count, err := s.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	} else if count != 1 {
+		t.Fatalf("expected the finishing runner to hold the slot, got %d", count)
+	}
+
+	// No further listener message: cleanup alone must provision the next runner.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		runners := s.Runners()
+		if len(runners) == 1 && runners[0].Name != first {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("assigned job was not refilled after cleanup; runners %v", runners)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if client.nextID != 3 {
+		t.Fatalf("expected exactly two JIT runners, next ID is %d", client.nextID)
+	}
+}
+
+func TestCleanupDoesNotRefillWithoutAssignment(t *testing.T) {
+	client := newMockClient()
+	prov := newMockProvisioner()
+	s := NewScaler(noopLogger(), client, 1, 1, "test",
+		&RunnerConfig{Docker: &DockerImage{Image: "test:latest"}}, prov)
+	defer s.Shutdown(context.Background())
+
+	if _, err := s.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	first := waitForRunnerCount(t, s, 1)[0].Name
+	if err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: first, Result: "succeeded"}); err != nil {
+		t.Fatalf("HandleJobCompleted: %v", err)
+	}
+	if _, err := s.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	waitForRunnerCount(t, s, 0)
+	time.Sleep(50 * time.Millisecond)
+	if n := len(s.Runners()); n != 0 {
+		t.Fatalf("expected no refill without an assignment, got %d runners", n)
+	}
+	if client.nextID != 2 {
+		t.Fatalf("expected exactly one JIT runner, next ID is %d", client.nextID)
+	}
+}
+
+func TestSynchronizedDrainRefillsAcceptedAssignmentThenDrains(t *testing.T) {
+	client := newMockClient()
+	prov := newMockProvisioner()
+	s := NewScaler(noopLogger(), client, 1, 1, "test",
+		&RunnerConfig{MaxJobs: 2, Docker: &DockerImage{Image: "test:latest"}}, prov,
+		WithAdmissionSynchronization())
+	defer s.Shutdown(context.Background())
+	session := NewDrainSession(nil, s)
+
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	first := waitForRunnerCount(t, s, 1)[0].Name
+	if err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: first, Result: "succeeded"}); err != nil {
+		t.Fatalf("HandleJobCompleted: %v", err)
+	}
+	// An earlier positive-capacity poll accepted a second job.
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	var second string
+	deadline := time.Now().Add(2 * time.Second)
+	for second == "" {
+		if runners := s.Runners(); len(runners) == 1 && runners[0].Name != first {
+			second = runners[0].Name
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("accepted assignment was not refilled after cleanup")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: second, Result: "succeeded"}); err != nil {
+		t.Fatalf("HandleJobCompleted: %v", err)
+	}
+	session.zeroCapacityPoll = true
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	waitForRunnerCount(t, s, 0)
+	// A zero-capacity poll processed after cleanup completes the drain.
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	select {
+	case <-s.Drained():
+	case <-time.After(2 * time.Second):
+		t.Fatal("scaler did not drain after serving the accepted assignment")
+	}
+	if client.nextID != 3 {
+		t.Fatalf("expected exactly two JIT runners, next ID is %d", client.nextID)
+	}
+}
+
+func TestSynchronizedDrainWaitsForGitHubCountNotLocalCompletion(t *testing.T) {
+	client := newMockClient()
+	prov := newMockProvisioner()
+	s := NewScaler(noopLogger(), client, 1, 1, "test",
+		&RunnerConfig{MaxJobs: 1, Docker: &DockerImage{Image: "test:latest"}}, prov,
+		WithAdmissionSynchronization())
+	defer s.Shutdown(context.Background())
+	session := NewDrainSession(nil, s)
+
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	first := waitForRunnerCount(t, s, 1)[0].Name
+	// A processed zero-capacity poll while the job still runs: GitHub counts it.
+	session.zeroCapacityPoll = true
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	if err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: first, Result: "succeeded"}); err != nil {
+		t.Fatalf("HandleJobCompleted: %v", err)
+	}
+	waitForRunnerCount(t, s, 0)
+
+	// Local completion accounting must not stand in for GitHub's statistics:
+	// an assignment accepted by an earlier poll may still be on its way.
+	select {
+	case <-s.Drained():
+		t.Fatal("drain proof published before GitHub reported zero assigned jobs")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	select {
+	case <-s.Drained():
+	case <-time.After(2 * time.Second):
+		t.Fatal("scaler did not drain after GitHub reported zero assigned jobs")
+	}
+}
