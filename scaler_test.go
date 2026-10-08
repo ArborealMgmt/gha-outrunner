@@ -1868,3 +1868,214 @@ func TestReapNotFoundWithWatcherWaitsForExit(t *testing.T) {
 	default:
 	}
 }
+
+func newPrespawnScaler(client *mockClient, prov *mockProvisioner, runner *RunnerConfig) (*Scaler, *DrainSession) {
+	if runner.Docker == nil {
+		runner.Docker = &DockerImage{Image: "test:latest"}
+	}
+	if runner.IdleRunners == 0 {
+		runner.IdleRunners = 1
+	}
+	s := NewScaler(noopLogger(), client, 1, 1, "test", runner, prov, WithAdmissionSynchronization())
+	return s, NewDrainSession(nil, s)
+}
+
+func TestIdleRunnersPrespawnsWithoutAnAssignment(t *testing.T) {
+	client := newMockClient()
+	s, session := newPrespawnScaler(client, newMockProvisioner(), &RunnerConfig{})
+	defer s.Shutdown(context.Background())
+
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	waitForIdle(t, s, 1)
+	// An assignment lands on the spare: no second runner beyond max_runners.
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	if n := len(s.Runners()); n != 1 || client.nextID != 2 {
+		t.Fatalf("expected the spare to take the assignment, runners=%d nextID=%d", n, client.nextID)
+	}
+}
+
+func TestIdleRunnersTopsUpAfterAJobWithoutANewMessage(t *testing.T) {
+	client := newMockClient()
+	s, session := newPrespawnScaler(client, newMockProvisioner(), &RunnerConfig{})
+	defer s.Shutdown(context.Background())
+
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	waitForIdle(t, s, 1)
+	first := s.Runners()[0].Name
+	if err := s.HandleJobStarted(context.Background(), &scaleset.JobStarted{RunnerName: first}); err != nil {
+		t.Fatalf("HandleJobStarted: %v", err)
+	}
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	if err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: first, Result: "succeeded"}); err != nil {
+		t.Fatalf("HandleJobCompleted: %v", err)
+	}
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if r := s.Runners(); len(r) == 1 && r[0].Name != first && r[0].Phase == RunnerIdle {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no spare after the job; runners %v", s.Runners())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestIdleRunnersStayWithinTheMaxJobsBudget(t *testing.T) {
+	client := newMockClient()
+	s, session := newPrespawnScaler(client, newMockProvisioner(), &RunnerConfig{MaxJobs: 2})
+	defer s.Shutdown(context.Background())
+
+	serve := func() string {
+		t.Helper()
+		waitForIdle(t, s, 1)
+		name := s.Runners()[0].Name
+		if err := s.HandleJobStarted(context.Background(), &scaleset.JobStarted{RunnerName: name}); err != nil {
+			t.Fatalf("HandleJobStarted: %v", err)
+		}
+		if _, err := session.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+			t.Fatalf("HandleDesiredRunnerCount: %v", err)
+		}
+		if err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: name, Result: "succeeded"}); err != nil {
+			t.Fatalf("HandleJobCompleted: %v", err)
+		}
+		return name
+	}
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	first := serve()
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	// One job left in the budget: one spare for it.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if r := s.Runners(); len(r) == 1 && r[0].Name != first && r[0].Phase == RunnerIdle {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no spare for the last job; runners %v", s.Runners())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	serve()
+	// max_jobs reached: no spare, and the host drains.
+	waitForRunnerCount(t, s, 0)
+	session.zeroCapacityPoll = true
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	select {
+	case <-s.Drained():
+	case <-time.After(2 * time.Second):
+		t.Fatalf("host did not drain at max_jobs; runners %v", s.Runners())
+	}
+	if client.nextID != 3 {
+		t.Fatalf("expected exactly two JIT runners for two jobs, next ID is %d", client.nextID)
+	}
+}
+
+func TestIdleRunnersSpareIsReapedOnExternalDrain(t *testing.T) {
+	client := newMockClient()
+	s, session := newPrespawnScaler(client, newMockProvisioner(), &RunnerConfig{MaxJobs: 5})
+	defer s.Shutdown(context.Background())
+
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	waitForIdle(t, s, 1)
+	if err := s.RequestDrain(); err != nil {
+		t.Fatalf("RequestDrain: %v", err)
+	}
+	waitForRunnerCount(t, s, 0)
+	session.zeroCapacityPoll = true
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	select {
+	case <-s.Drained():
+	case <-time.After(2 * time.Second):
+		t.Fatal("external drain never completed with a spare runner")
+	}
+	if n := len(s.Runners()); n != 0 {
+		t.Fatalf("drain must not top the spare back up, %d runners", n)
+	}
+}
+
+func TestIdleRunnersSpareDoesNotBlockIdleLinger(t *testing.T) {
+	client := newMockClient()
+	s := NewScaler(noopLogger(), client, 1, 1, "test",
+		&RunnerConfig{IdleRunners: 1, IdleDrainAfter: 150 * time.Millisecond, Docker: &DockerImage{Image: "test:latest"}},
+		newMockProvisioner())
+	defer s.Shutdown(context.Background())
+
+	if _, err := s.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	waitForIdle(t, s, 1)
+	select {
+	case <-s.Drained():
+	case <-time.After(2 * time.Second):
+		t.Fatalf("a parked spare kept the host from idle drain; runners %v", s.Runners())
+	}
+	if n := len(s.Runners()); n != 0 {
+		t.Fatalf("expected the spare reaped on idle drain, %d runners", n)
+	}
+}
+
+func TestIdleRunnersAssignedSpareBlocksIdleLinger(t *testing.T) {
+	client := newMockClient()
+	s := NewScaler(noopLogger(), client, 1, 1, "test",
+		&RunnerConfig{IdleRunners: 1, IdleDrainAfter: 100 * time.Millisecond, Docker: &DockerImage{Image: "test:latest"}},
+		newMockProvisioner())
+	defer s.Shutdown(context.Background())
+
+	if _, err := s.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	waitForIdle(t, s, 1)
+	select {
+	case <-s.Drained():
+		t.Fatal("idle linger drained a host whose runner covers an assignment")
+	case <-time.After(400 * time.Millisecond):
+	}
+}
+
+func TestIdleRunnersNoSpareBeyondTheLastJobWithTwoSlots(t *testing.T) {
+	client := newMockClient()
+	s := NewScaler(noopLogger(), client, 1, 2, "test",
+		&RunnerConfig{IdleRunners: 1, MaxJobs: 1, Docker: &DockerImage{Image: "test:latest"}},
+		newMockProvisioner(), WithAdmissionSynchronization())
+	defer s.Shutdown(context.Background())
+	session := NewDrainSession(nil, s)
+
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 0); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	waitForIdle(t, s, 1)
+	name := s.Runners()[0].Name
+	if err := s.HandleJobStarted(context.Background(), &scaleset.JobStarted{RunnerName: name}); err != nil {
+		t.Fatalf("HandleJobStarted: %v", err)
+	}
+	// The host's only job is running: a second slot is free, but max_jobs
+	// leaves nothing for a spare to serve.
+	if _, err := session.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := len(s.Runners()); n != 1 || client.nextID != 2 {
+		t.Fatalf("spawned a spare past max_jobs: runners=%d nextID=%d", n, client.nextID)
+	}
+}
