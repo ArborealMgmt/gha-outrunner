@@ -27,8 +27,9 @@ var diagnosticsMu sync.Mutex
 
 // Provisioner creates ephemeral Docker containers as GitHub Actions runners.
 type Provisioner struct {
-	logger *slog.Logger
-	client *client.Client
+	logger        *slog.Logger
+	client        *client.Client
+	releaseOrphan OrphanReleaser
 }
 
 func New(logger *slog.Logger) (*Provisioner, error) {
@@ -251,6 +252,16 @@ func (d *Provisioner) preserveLogs(ctx context.Context, name string) {
 	d.logger.Info("Container diagnostics retained", slog.String("name", name), slog.String("path", path))
 }
 
+// OrphanReleaser decides whether a running orphan from a prior process may be
+// stopped. It returns true only once GitHub can no longer give that runner a
+// job: it is not registered, or it was just deregistered while idle.
+type OrphanReleaser func(ctx context.Context, name string) (bool, error)
+
+// SetOrphanReleaser lets Cleanup stop a running orphan that GitHub confirms is
+// idle instead of waiting for it. Without one, Cleanup waits for every running
+// orphan to exit, which an idle runner never does without a listener.
+func (d *Provisioner) SetOrphanReleaser(release OrphanReleaser) { d.releaseOrphan = release }
+
 // Cleanup removes retained environments from a prior process using both our
 // ownership label and the exact scale-set name prefix.
 func (d *Provisioner) Cleanup(ctx context.Context, prefix string) error {
@@ -264,6 +275,20 @@ func (d *Provisioner) Cleanup(ctx context.Context, prefix string) error {
 			continue
 		}
 		if item.State != "exited" && item.State != "dead" && item.State != "created" {
+			if d.releaseOrphan != nil {
+				release, err := d.releaseOrphan(ctx, name)
+				if err != nil {
+					return fmt.Errorf("check orphan %s with GitHub: %w", name, err)
+				}
+				if release {
+					// GitHub can no longer hand this runner a job, so stopping it
+					// cannot abort one.
+					d.logger.Info("Stopping idle orphan runner deregistered from GitHub", slog.String("name", name))
+					if err := d.client.ContainerStop(ctx, name, container.StopOptions{}); err != nil && !errdefs.IsNotFound(err) && !errdefs.IsNotModified(err) {
+						return fmt.Errorf("stop idle orphan %s: %w", name, err)
+					}
+				}
+			}
 			// A process restart must not abort a job that survived it. Refuse
 			// new admission and drain proof until the old environment exits.
 			d.logger.Warn("Waiting for surviving runner before admission", slog.String("name", name))

@@ -56,6 +56,12 @@ type Scaler struct {
 	// The listener replaces assignedJobs in the same message as a completion,
 	// so this matters only if cleanup wins that race.
 	servedSinceStatistics int
+	// unserved holds runners removed without a recorded job. A completion that
+	// arrives for one after its exit grace is still counted, until the receipt
+	// is written (receiptWritten).
+	unserved       map[string]bool
+	unservedOrder  []string
+	receiptWritten bool
 
 	lifecycleCtx    context.Context
 	lifecycleCancel context.CancelFunc
@@ -85,6 +91,7 @@ func NewScaler(logger *slog.Logger, client ScaleSetClient, scaleSetID, maxRunner
 		provisioner:      prov,
 		runners:          make(map[string]*RunnerState),
 		completedRunners: make(map[string]bool),
+		unserved:         make(map[string]bool),
 		jobQueueTimes:    make(map[string]time.Time),
 		drained:          make(chan struct{}),
 		admissionClosed:  make(chan struct{}),
@@ -142,7 +149,7 @@ func (s *Scaler) reconcileLocked(ctx context.Context, count int) (int, error) {
 			s.scaleSetID,
 		)
 		if err != nil {
-			if len(s.runners) >= min(s.maxRunners, count) {
+			if s.liveRunnersLocked() >= min(s.maxRunners, count) {
 				// Every assignment has a runner; only a spare failed. Retry on
 				// the next message rather than ending the listener.
 				s.logger.Warn("Spare runner JIT request failed", slog.String("error", err.Error()))
@@ -211,50 +218,27 @@ func (s *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 
 	s.mu.Lock()
 	state, exists := s.runners[jobInfo.RunnerName]
-	if !exists && jobInfo.RunnerName != "" {
+	switch {
+	case exists && !s.completedRunners[jobInfo.RunnerName]:
+		s.completedRunners[jobInfo.RunnerName] = true
+		s.recordCompletionLocked(jobInfo)
+	case !exists && s.unserved[jobInfo.RunnerName] && !s.receiptWritten:
+		// The runner served this job but its completion outlasted the exit
+		// grace, so it was removed as unserved. Count the job now: the drain
+		// proof waits for this message's statistics, so it is not lost.
+		delete(s.unserved, jobInfo.RunnerName)
+		s.logger.Warn("Recorded a completion that arrived after its runner was removed",
+			slog.String("runnerName", jobInfo.RunnerName), slog.Int64("workflowRunId", jobInfo.WorkflowRunID))
+		s.recordCompletionLocked(jobInfo)
+		// No runner removal follows this completion, so if it closed admission
+		// on an empty host, publish the drain proof here (synchronized mode
+		// still waits for this message's statistics).
+		if s.draining && !s.drainFailed && len(s.runners) == 0 {
+			_ = s.finishDrainLocked()
+		}
+	case !exists && jobInfo.RunnerName != "":
 		s.logger.Warn("Completion received for untracked runner; receipt accounting may be incomplete",
 			slog.String("runnerName", jobInfo.RunnerName), slog.Int64("workflowRunId", jobInfo.WorkflowRunID))
-	}
-	if exists && !s.completedRunners[jobInfo.RunnerName] {
-		queueTime := receiptQueueTime(
-			jobInfo.QueueTime,
-			s.jobQueueTimes[jobInfo.RunnerName],
-			jobInfo.ScaleSetAssignTime,
-		)
-		s.completedRunners[jobInfo.RunnerName] = true
-		s.completedJobInfo = append(s.completedJobInfo, DrainJob{
-			RunnerName:         jobInfo.RunnerName,
-			RunnerID:           jobInfo.RunnerID,
-			RunnerRequestID:    jobInfo.RunnerRequestID,
-			JobID:              jobInfo.JobID,
-			JobWorkflowRef:     jobInfo.JobWorkflowRef,
-			JobDisplayName:     jobInfo.JobDisplayName,
-			WorkflowRunID:      jobInfo.WorkflowRunID,
-			Repository:         jobInfo.OwnerName + "/" + jobInfo.RepositoryName,
-			RequestLabels:      append([]string{}, jobInfo.RequestLabels...),
-			Result:             jobInfo.Result,
-			QueueTime:          queueTime,
-			ScaleSetAssignTime: jobInfo.ScaleSetAssignTime,
-			RunnerAssignTime:   jobInfo.RunnerAssignTime,
-			FinishedAt:         jobInfo.FinishTime,
-		})
-		s.completedJobs++
-		// The finished job no longer holds an assignment, but assignedJobs
-		// predates its completion until the listener applies this message's
-		// statistics, which it does right after this callback returns.
-		s.servedSinceStatistics++
-		s.idleSince = time.Now()
-		if s.runner.MaxJobs > 0 && s.completedJobs >= s.runner.MaxJobs && !s.draining {
-			s.draining = true
-			close(s.admissionClosed)
-			s.drainReason = "max_jobs"
-			s.logger.Info("Maximum job count reached; stopping admission",
-				slog.Int("completedJobs", s.completedJobs),
-				slog.Int("maxJobs", s.runner.MaxJobs),
-			)
-			// No reap here: assignedJobs predates this message's statistics,
-			// which HandleDesiredRunnerCount applies (and reaps on) next.
-		}
 	}
 	s.mu.Unlock()
 
@@ -263,6 +247,66 @@ func (s *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 	}
 
 	return nil
+}
+
+// unservedLimit bounds how many removed runners are remembered for late
+// completions. The oldest go first: a late completion follows its runner's
+// removal by at most a few listener messages.
+const unservedLimit = 64
+
+// rememberUnservedLocked records a runner removed without a recorded job, so
+// a completion that outlasted its exit grace is still counted. Callers hold
+// s.mu.
+func (s *Scaler) rememberUnservedLocked(name string) {
+	for len(s.unservedOrder) >= unservedLimit {
+		delete(s.unserved, s.unservedOrder[0])
+		s.unservedOrder = s.unservedOrder[1:]
+	}
+	s.unserved[name] = true
+	s.unservedOrder = append(s.unservedOrder, name)
+}
+
+// recordCompletionLocked adds a finished job to the drain receipt and the
+// max_jobs count. Callers hold s.mu.
+func (s *Scaler) recordCompletionLocked(jobInfo *scaleset.JobCompleted) {
+	queueTime := receiptQueueTime(
+		jobInfo.QueueTime,
+		s.jobQueueTimes[jobInfo.RunnerName],
+		jobInfo.ScaleSetAssignTime,
+	)
+	s.completedJobInfo = append(s.completedJobInfo, DrainJob{
+		RunnerName:         jobInfo.RunnerName,
+		RunnerID:           jobInfo.RunnerID,
+		RunnerRequestID:    jobInfo.RunnerRequestID,
+		JobID:              jobInfo.JobID,
+		JobWorkflowRef:     jobInfo.JobWorkflowRef,
+		JobDisplayName:     jobInfo.JobDisplayName,
+		WorkflowRunID:      jobInfo.WorkflowRunID,
+		Repository:         jobInfo.OwnerName + "/" + jobInfo.RepositoryName,
+		RequestLabels:      append([]string{}, jobInfo.RequestLabels...),
+		Result:             jobInfo.Result,
+		QueueTime:          queueTime,
+		ScaleSetAssignTime: jobInfo.ScaleSetAssignTime,
+		RunnerAssignTime:   jobInfo.RunnerAssignTime,
+		FinishedAt:         jobInfo.FinishTime,
+	})
+	s.completedJobs++
+	// The finished job no longer holds an assignment, but assignedJobs
+	// predates its completion until the listener applies this message's
+	// statistics, which it does right after this callback returns.
+	s.servedSinceStatistics++
+	s.idleSince = time.Now()
+	if s.runner.MaxJobs > 0 && s.completedJobs >= s.runner.MaxJobs && !s.draining {
+		s.draining = true
+		close(s.admissionClosed)
+		s.drainReason = "max_jobs"
+		s.logger.Info("Maximum job count reached; stopping admission",
+			slog.Int("completedJobs", s.completedJobs),
+			slog.Int("maxJobs", s.runner.MaxJobs),
+		)
+		// No reap here: assignedJobs predates this message's statistics,
+		// which HandleDesiredRunnerCount applies (and reaps on) next.
+	}
 }
 
 func receiptQueueTime(completed, started, assigned time.Time) time.Time {
@@ -516,11 +560,17 @@ func (s *Scaler) removeRunner(name string, cleaned bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	servedJob := s.completedRunners[name]
-	reaped := false
+	reaped, couldHaveServed := false, false
 	if state, ok := s.runners[name]; ok {
 		reaped = state.reaped
+		// Only a runner that came up and was not proven idle by GitHub can
+		// report a job after it is gone.
+		couldHaveServed = !state.StartedAt.IsZero() && !state.deregistered
 	}
 	delete(s.runners, name)
+	if !servedJob && couldHaveServed {
+		s.rememberUnservedLocked(name)
+	}
 	// Only finished work restarts the idle clock. A spare that failed to start
 	// or exited without a job must not keep a broken host from retiring.
 	if servedJob {
@@ -556,6 +606,19 @@ func (s *Scaler) targetLocked(count int) int {
 		}
 	}
 	return min(s.maxRunners, count+extra)
+}
+
+// liveRunnersLocked counts runners that can still serve an assignment: not
+// finished with a job and not stopping (dead, failed to start, or reaped).
+// Callers hold s.mu.
+func (s *Scaler) liveRunnersLocked() int {
+	live := 0
+	for _, state := range s.runners {
+		if !s.completedRunners[state.Name] && state.Phase != RunnerStopping {
+			live++
+		}
+	}
+	return live
 }
 
 // pendingLocked is the number of assignments not yet started on a runner:
@@ -594,12 +657,9 @@ func (s *Scaler) spareRunnersLocked() (provisioning int, idle []*RunnerState) {
 }
 
 // workingLocked counts runners that hold the host awake for idle linger:
-// everything except spare runners when idle_runners pre-spawns them. Without
-// idle_runners, any tracked runner counts, as before. Callers hold s.mu.
+// everything except spare runners, whether idle_runners pre-spawned them or
+// an assignment that spawned them went away. Callers hold s.mu.
 func (s *Scaler) workingLocked() int {
-	if s.runner.IdleRunners <= 0 {
-		return len(s.runners)
-	}
 	provisioning, idle := s.spareRunnersLocked()
 	return len(s.runners) - provisioning - len(idle)
 }
@@ -690,6 +750,7 @@ func (s *Scaler) reapRunner(state *RunnerState) {
 		// lifecycle goroutine stops the container; its own deregistration
 		// then finds the runner gone, which counts as success.
 		state.reaped = true
+		state.deregistered = true
 		state.Phase = RunnerStopping
 		state.SignalDone()
 	case errors.Is(err, scaleset.RunnerNotFoundError) && watched:
@@ -754,6 +815,7 @@ func (s *Scaler) finishDrainLocked() error {
 		}
 		s.logger.Info("Drain receipt written", slog.String("path", s.runner.DrainReceipt.Path))
 	}
+	s.receiptWritten = true
 	s.drainedOnce.Do(func() { close(s.drained) })
 	return nil
 }

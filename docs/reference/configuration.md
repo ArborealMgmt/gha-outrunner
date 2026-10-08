@@ -140,12 +140,11 @@ message cannot create replacement work on the draining host.
 
 **Optional.** A nonnegative duration such as `5m`; the default `0s` disables idle drain.
 The idle clock starts after scale-set registration, so a host with no jobs also retires.
-Each completed job restarts the clock. Provisioning, idle JIT runners, running jobs, and
-cleanup all prevent idle drain; admission closes atomically under the scaler mutex only
-when no runner remains. With `idle_runners` set, only runners a job or assignment needs
-prevent it: spares do not, the host still retires after the linger, and its spares are
-deregistered as it drains. A spare that fails to start or exits without a job does not
-restart the clock. Failed cleanup prevents a successful receipt.
+Each completed job restarts the clock. Running jobs, cleanup, and runners covering an
+assignment GitHub has made prevent idle drain; spare runners do not, whether `idle_runners`
+pre-spawned them or the assignment that spawned them went away. On expiry, admission closes
+and spares are deregistered as the host drains. A runner that fails to start or exits
+without a job does not restart the clock. Failed cleanup prevents a successful receipt.
 
 On expiry, Outrunner writes the configured drain receipt with `reason: "idle"` (version 2
 for zero jobs, version 3 otherwise) and exits successfully. The existing systemd
