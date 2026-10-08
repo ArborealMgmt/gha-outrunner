@@ -27,6 +27,7 @@ type RunnerConfig struct {
 	TokenFile      string              `yaml:"token_file,omitempty"`
 	Labels         []string            `yaml:"labels"`
 	MaxRunners     int                 `yaml:"max_runners,omitempty"`
+	IdleRunners    int                 `yaml:"idle_runners,omitempty"`
 	IdleDrainAfter time.Duration       `yaml:"idle_drain_after,omitempty"`
 	MaxJobs        int                 `yaml:"max_jobs,omitempty"`
 	DrainReceipt   *DrainReceiptConfig `yaml:"drain_receipt,omitempty"`
@@ -129,6 +130,12 @@ func LoadConfig(path string) (*Config, error) {
 		}
 		if runner.MaxJobs < 0 {
 			return nil, fmt.Errorf("runner %q: max_jobs must not be negative", name)
+		}
+		if runner.IdleRunners < 0 {
+			return nil, fmt.Errorf("runner %q: idle_runners must not be negative", name)
+		}
+		if runner.MaxRunners > 0 && runner.IdleRunners > runner.MaxRunners {
+			return nil, fmt.Errorf("runner %q: idle_runners must not exceed max_runners", name)
 		}
 		if runner.DrainReceipt != nil {
 			if runner.MaxJobs == 0 {

@@ -837,3 +837,32 @@ func TestProviderType(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadConfigIdleRunners(t *testing.T) {
+	cases := map[string]struct {
+		body string
+		want string
+	}{
+		"negative":         {"max_runners: 1\n    idle_runners: -1", "idle_runners must not be negative"},
+		"above max":        {"max_runners: 1\n    idle_runners: 2", "idle_runners must not exceed max_runners"},
+		"within max":       {"max_runners: 2\n    idle_runners: 1", ""},
+		"default max flag": {"idle_runners: 1", ""},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yml")
+			content := "url: https://github.com/org\ntoken_file: /tmp/token\nrunners:\n  linux:\n    labels: [linux]\n    " +
+				tc.body + "\n    docker:\n      image: test:latest\n"
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			_, err := LoadConfig(path)
+			if tc.want == "" && err != nil {
+				t.Fatalf("LoadConfig: %v", err)
+			}
+			if tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)) {
+				t.Fatalf("expected error containing %q, got %v", tc.want, err)
+			}
+		})
+	}
+}

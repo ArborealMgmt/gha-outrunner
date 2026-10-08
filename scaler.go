@@ -112,6 +112,9 @@ func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 	s.servedSinceStatistics = 0
 	current, err := s.reconcileLocked(ctx, count)
 	s.reapIdleLocked()
+	// An assignment that went away can leave only spares: restart the linger
+	// that an earlier expiry skipped while they covered it.
+	s.armIdleTimerLocked()
 	return current, err
 }
 
@@ -122,7 +125,7 @@ func (s *Scaler) reconcileLocked(ctx context.Context, count int) (int, error) {
 		return len(s.runners), nil
 	}
 
-	target := min(s.maxRunners, count)
+	target := s.targetLocked(count)
 	current := len(s.runners)
 
 	s.logger.Debug("Desired runner count",
@@ -139,6 +142,12 @@ func (s *Scaler) reconcileLocked(ctx context.Context, count int) (int, error) {
 			s.scaleSetID,
 		)
 		if err != nil {
+			if len(s.runners) >= min(s.maxRunners, count) {
+				// Every assignment has a runner; only a spare failed. Retry on
+				// the next message rather than ending the listener.
+				s.logger.Warn("Spare runner JIT request failed", slog.String("error", err.Error()))
+				return len(s.runners), nil
+			}
 			return len(s.runners), fmt.Errorf("generate JIT config: %w", err)
 		}
 
@@ -294,7 +303,7 @@ func (s *Scaler) RequestDrain() error {
 // armIdleTimerLocked starts or resumes the remaining linger interval. Callers
 // hold s.mu, the same lock used for admission and the terminal idle decision.
 func (s *Scaler) armIdleTimerLocked() {
-	if s.runner.IdleDrainAfter <= 0 || s.draining || s.drainFailed || s.lifecycleCtx.Err() != nil || len(s.runners) != 0 {
+	if s.runner.IdleDrainAfter <= 0 || s.draining || s.drainFailed || s.lifecycleCtx.Err() != nil || s.workingLocked() != 0 {
 		return
 	}
 	remaining := max(time.Duration(0), s.runner.IdleDrainAfter-time.Since(s.idleSince))
@@ -307,7 +316,7 @@ func (s *Scaler) armIdleTimerLocked() {
 func (s *Scaler) checkIdleDrain() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.runner.IdleDrainAfter <= 0 || s.draining || s.drainFailed || s.lifecycleCtx.Err() != nil || len(s.runners) != 0 {
+	if s.runner.IdleDrainAfter <= 0 || s.draining || s.drainFailed || s.lifecycleCtx.Err() != nil || s.workingLocked() != 0 {
 		return
 	}
 	// A previously scheduled callback may race a new job and its cleanup.
@@ -320,7 +329,12 @@ func (s *Scaler) checkIdleDrain() {
 	close(s.admissionClosed)
 	s.drainReason = "idle"
 	s.logger.Info("Idle linger expired; stopping admission")
-	_ = s.finishDrainLocked()
+	if len(s.runners) == 0 {
+		_ = s.finishDrainLocked()
+		return
+	}
+	// Pre-spawned spares are deregistered; the last removal finishes drain.
+	s.reapIdleLocked()
 }
 
 // AdmissionClosed instructs the listener to advertise zero capacity. It does
@@ -507,7 +521,11 @@ func (s *Scaler) removeRunner(name string, cleaned bool) {
 		reaped = state.reaped
 	}
 	delete(s.runners, name)
-	s.idleSince = time.Now()
+	// Only finished work restarts the idle clock. A spare that failed to start
+	// or exited without a job must not keep a broken host from retiring.
+	if servedJob {
+		s.idleSince = time.Now()
+	}
 	delete(s.completedRunners, name)
 	delete(s.jobQueueTimes, name)
 	if !cleaned {
@@ -522,6 +540,68 @@ func (s *Scaler) removeRunner(name string, cleaned bool) {
 	if s.draining && !s.drainFailed && len(s.runners) == 0 {
 		_ = s.finishDrainLocked()
 	}
+}
+
+// targetLocked is how many runners to track for count assigned jobs: one per
+// assignment plus, while admission is open, idle_runners pre-registered
+// spares so the next job starts without waiting for a container and runner
+// registration. Spares never exceed what max_jobs can still use, so a host's
+// last job does not leave an idle runner behind. Callers hold s.mu.
+func (s *Scaler) targetLocked(count int) int {
+	extra := 0
+	if !s.draining && s.runner.IdleRunners > 0 {
+		extra = s.runner.IdleRunners
+		if s.runner.MaxJobs > 0 {
+			extra = min(extra, max(0, s.runner.MaxJobs-s.completedJobs-count))
+		}
+	}
+	return min(s.maxRunners, count+extra)
+}
+
+// pendingLocked is the number of assignments not yet started on a runner:
+// GitHub's latest count, less completions since it arrived and runners with
+// a job running. Callers hold s.mu.
+func (s *Scaler) pendingLocked() int {
+	running := 0
+	for _, state := range s.runners {
+		if state.Phase == RunnerRunning && !s.completedRunners[state.Name] {
+			running++
+		}
+	}
+	return max(0, s.assignedJobs-s.servedSinceStatistics-running)
+}
+
+// spareRunnersLocked splits the runners waiting for work into those no
+// pending assignment needs. Ready idle runners cover assignments first, since
+// GitHub hands a job to a runner that is already online. It returns how many
+// provisioning runners are spare, and the spare idle runners. Callers hold s.mu.
+func (s *Scaler) spareRunnersLocked() (provisioning int, idle []*RunnerState) {
+	var ready []*RunnerState
+	for _, state := range s.runners {
+		if s.completedRunners[state.Name] || state.reaping {
+			continue
+		}
+		switch state.Phase {
+		case RunnerProvisioning:
+			provisioning++
+		case RunnerIdle:
+			ready = append(ready, state)
+		}
+	}
+	pending := s.pendingLocked()
+	covered := min(pending, len(ready))
+	return max(0, provisioning-(pending-covered)), ready[covered:]
+}
+
+// workingLocked counts runners that hold the host awake for idle linger:
+// everything except spare runners when idle_runners pre-spawns them. Without
+// idle_runners, any tracked runner counts, as before. Callers hold s.mu.
+func (s *Scaler) workingLocked() int {
+	if s.runner.IdleRunners <= 0 {
+		return len(s.runners)
+	}
+	provisioning, idle := s.spareRunnersLocked()
+	return len(s.runners) - provisioning - len(idle)
 }
 
 // refillTimeout bounds the JIT request a refill makes while holding s.mu.
@@ -545,7 +625,7 @@ func (s *Scaler) refillLocked() {
 		return
 	}
 	pending := max(0, s.assignedJobs-s.servedSinceStatistics)
-	if min(s.maxRunners, pending) <= len(s.runners) {
+	if s.targetLocked(pending) <= len(s.runners) {
 		return
 	}
 	s.wg.Add(1)
@@ -579,24 +659,8 @@ func (s *Scaler) reapIdleLocked() {
 	if !s.draining || s.drainFailed || s.lifecycleCtx.Err() != nil {
 		return
 	}
-	running := 0
-	var idle []*RunnerState
-	for _, state := range s.runners {
-		switch {
-		case s.completedRunners[state.Name]:
-			// Its job is done: servedSinceStatistics already accounts for it.
-		case state.Phase == RunnerRunning:
-			running++
-		case state.Phase == RunnerIdle && !state.reaping:
-			idle = append(idle, state)
-		}
-	}
-	// Assignments not yet started on a runner may still land on an idle one.
-	pending := max(0, s.assignedJobs-s.servedSinceStatistics-running)
-	if len(idle) <= pending {
-		return
-	}
-	for _, state := range idle[pending:] {
+	_, idle := s.spareRunnersLocked()
+	for _, state := range idle {
 		state.reaping = true
 		s.wg.Add(1)
 		go s.reapRunner(state)
@@ -634,6 +698,8 @@ func (s *Scaler) reapRunner(state *RunnerState) {
 		// its messages arrived. Its container exits on its own either way;
 		// the exit watcher and the job's messages record what happened.
 		s.logger.Info("Idle runner already deregistered; waiting for its exit", slog.String("name", state.Name))
+		// Refill when it goes, so an assignment it was covering is served.
+		state.reaped = true
 	case errors.Is(err, scaleset.RunnerNotFoundError):
 		state.reaped = true
 		state.Phase = RunnerStopping
