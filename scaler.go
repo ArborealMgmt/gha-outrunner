@@ -634,6 +634,18 @@ func (s *Scaler) pendingLocked() int {
 	return max(0, s.assignedJobs-s.servedSinceStatistics-running)
 }
 
+// PollCapacity is the capacity to advertise on the next message poll: maximum
+// less the assignments GitHub still holds against this scale set (running
+// jobs included). GitHub assigns against the advertised figure, so offering
+// the full maximum while busy parks a queued job behind the running one until
+// that job ends or GitHub releases the assignment about five minutes later,
+// even while other scale sets with the same labels have idle runners.
+func (s *Scaler) PollCapacity(maximum int) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return max(0, maximum-max(0, s.assignedJobs-s.servedSinceStatistics))
+}
+
 // spareRunnersLocked splits the runners waiting for work into those no
 // pending assignment needs. Ready idle runners cover assignments first, since
 // GitHub hands a job to a runner that is already online. It returns how many

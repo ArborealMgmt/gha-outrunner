@@ -179,3 +179,101 @@ func TestFailedZeroCapacityPollCannotProveDrain(t *testing.T) {
 	_, _ = d.HandleDesiredRunnerCount(ctx, 0)
 	assertNotDrained(t, s)
 }
+
+func TestPollAdvertisesFreeCapacityWhileBusy(t *testing.T) {
+	ctx := context.Background()
+	s := NewScaler(noopLogger(), newMockClient(), 1, 1, "test", &RunnerConfig{}, newMockProvisioner(), WithAdmissionSynchronization())
+	defer s.Shutdown(ctx)
+	var advertised []int
+	d := NewDrainSession(&drainPollClient{get: func(_ context.Context, _, capacity int) (*scaleset.RunnerScaleSetMessage, error) {
+		advertised = append(advertised, capacity)
+		return nil, nil
+	}}, s)
+
+	_, _ = d.GetMessage(ctx, 0, 1)
+	_, _ = d.HandleDesiredRunnerCount(ctx, 1)
+	name, id := waitRunner(t, s, "")
+	_ = d.HandleJobStarted(ctx, &scaleset.JobStarted{RunnerName: name, RunnerID: id})
+	// GitHub's assigned count includes the running job: the single slot is
+	// taken, so the host must not invite a second assignment.
+	_, _ = d.GetMessage(ctx, 1, 1)
+	_ = d.HandleJobCompleted(ctx, &scaleset.JobCompleted{RunnerName: name, RunnerID: id, Result: "succeeded"})
+	// The completion frees the slot before this message's statistics land.
+	_, _ = d.GetMessage(ctx, 2, 1)
+	_, _ = d.HandleDesiredRunnerCount(ctx, 0)
+	_, _ = d.GetMessage(ctx, 3, 1)
+
+	want := []int{1, 0, 1, 1}
+	if len(advertised) != len(want) {
+		t.Fatalf("advertised=%v want %v", advertised, want)
+	}
+	for i := range want {
+		if advertised[i] != want[i] {
+			t.Fatalf("advertised=%v want %v", advertised, want)
+		}
+	}
+}
+
+func TestPollCapacityCountsOnlyOutstandingAssignments(t *testing.T) {
+	ctx := context.Background()
+	s := NewScaler(noopLogger(), newMockClient(), 1, 4, "test", &RunnerConfig{}, newMockProvisioner())
+	defer s.Shutdown(ctx)
+	if got := s.PollCapacity(4); got != 4 {
+		t.Fatalf("idle capacity=%d", got)
+	}
+	_, _ = s.HandleDesiredRunnerCount(ctx, 3)
+	if got := s.PollCapacity(4); got != 1 {
+		t.Fatalf("capacity with 3 assigned=%d", got)
+	}
+	_, _ = s.HandleDesiredRunnerCount(ctx, 6)
+	if got := s.PollCapacity(4); got != 0 {
+		t.Fatalf("over-assigned capacity=%d", got)
+	}
+}
+
+func TestBusyZeroCapacityPollDoesNotFenceDrain(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "receipt.json")
+	s := NewScaler(noopLogger(), newMockClient(), 1, 1, "test", &RunnerConfig{DrainReceipt: &DrainReceiptConfig{Path: path}}, newMockProvisioner(), WithAdmissionSynchronization())
+	defer s.Shutdown(ctx)
+	var advertised []int
+	d := NewDrainSession(&drainPollClient{get: func(_ context.Context, _, capacity int) (*scaleset.RunnerScaleSetMessage, error) {
+		advertised = append(advertised, capacity)
+		return nil, nil
+	}}, s)
+
+	_, _ = d.HandleDesiredRunnerCount(ctx, 1)
+	name, id := waitRunner(t, s, "")
+	_ = d.HandleJobStarted(ctx, &scaleset.JobStarted{RunnerName: name, RunnerID: id})
+	// Busy, so this poll advertises zero while admission is still open.
+	_, _ = d.GetMessage(ctx, 1, 1)
+	if advertised[0] != 0 {
+		t.Fatalf("busy poll capacity=%d", advertised[0])
+	}
+	_ = d.HandleJobCompleted(ctx, &scaleset.JobCompleted{RunnerName: name, RunnerID: id, Result: "succeeded"})
+	_, _ = d.HandleDesiredRunnerCount(ctx, 0)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		s.mu.Lock()
+		empty := len(s.runners) == 0
+		s.mu.Unlock()
+		if empty {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := s.RequestDrain(); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = d.HandleDesiredRunnerCount(ctx, 0)
+	assertNotDrained(t, s)
+
+	// Only a poll made after admission closed proves no new assignment.
+	_, _ = d.GetMessage(ctx, 2, 1)
+	_, _ = d.HandleDesiredRunnerCount(ctx, 0)
+	select {
+	case <-s.Drained():
+	case <-time.After(2 * time.Second):
+		t.Fatal("drain never completed")
+	}
+}

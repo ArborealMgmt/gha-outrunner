@@ -22,13 +22,17 @@ func NewDrainSession(client listener.Client, scaler *Scaler) *DrainSession {
 }
 
 func (d *DrainSession) GetMessage(ctx context.Context, lastID, capacity int) (*scaleset.RunnerScaleSetMessage, error) {
+	admissionClosed := false
 	select {
 	case <-d.AdmissionClosed():
-		capacity = 0
+		capacity, admissionClosed = 0, true
 	default:
+		capacity = d.PollCapacity(capacity)
 	}
 	message, err := d.Client.GetMessage(ctx, lastID, capacity)
-	if err == nil && capacity == 0 {
+	// A busy host also polls at zero capacity, but only a poll made after
+	// admission closed fences assignments for the drain proof.
+	if err == nil && admissionClosed {
 		d.zeroCapacityPoll = true
 	}
 	return message, err
